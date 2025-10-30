@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: codebase-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # MCP Server for semantic code search
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: codebase-mcp-server
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      # Mount the codebase to be indexed (customize this path)
+      - ${CODEBASE_PATH:-./sample_codebase}:/workspace:ro
+      # Persistent storage for index data
+      - index_data:/index
+      # Persistent storage for embedding cache
+      - cache_data:/cache
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - INDEX_PATH=/index
+      - CACHE_PATH=/cache
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - WORKSPACE_PATH=/workspace
+    restart: unless-stopped
+    # Use stdin/stdout for MCP protocol communication
+    stdin_open: true
+    tty: true
+    # For Docker Desktop, use host.docker.internal to access host machine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  qdrant_data:
+    driver: local
+  index_data:
+    driver: local
+  cache_data:
+    driver: local

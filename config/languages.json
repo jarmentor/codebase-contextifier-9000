@@ -1,0 +1,203 @@
+{
+  "python": {
+    "extensions": [".py", ".pyw"],
+    "tree_sitter_language": "python",
+    "chunk_types": {
+      "function_definition": {
+        "name_field": "name",
+        "docstring_field": "body.expression_statement.string"
+      },
+      "class_definition": {
+        "name_field": "name",
+        "docstring_field": "body.expression_statement.string"
+      },
+      "decorated_definition": {
+        "name_field": "definition.name"
+      }
+    },
+    "comment_patterns": ["#"]
+  },
+  "javascript": {
+    "extensions": [".js", ".jsx", ".mjs", ".cjs"],
+    "tree_sitter_language": "javascript",
+    "chunk_types": {
+      "function_declaration": {
+        "name_field": "name"
+      },
+      "function": {
+        "name_field": "name"
+      },
+      "arrow_function": {
+        "name_field": null
+      },
+      "class_declaration": {
+        "name_field": "name"
+      },
+      "method_definition": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "typescript": {
+    "extensions": [".ts", ".tsx"],
+    "tree_sitter_language": "typescript",
+    "chunk_types": {
+      "function_declaration": {
+        "name_field": "name"
+      },
+      "function": {
+        "name_field": "name"
+      },
+      "arrow_function": {
+        "name_field": null
+      },
+      "class_declaration": {
+        "name_field": "name"
+      },
+      "method_definition": {
+        "name_field": "name"
+      },
+      "interface_declaration": {
+        "name_field": "name"
+      },
+      "type_alias_declaration": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "php": {
+    "extensions": [".php", ".php3", ".php4", ".php5", ".phtml"],
+    "tree_sitter_language": "php",
+    "chunk_types": {
+      "function_definition": {
+        "name_field": "name"
+      },
+      "method_declaration": {
+        "name_field": "name"
+      },
+      "class_declaration": {
+        "name_field": "name"
+      },
+      "interface_declaration": {
+        "name_field": "name"
+      },
+      "trait_declaration": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*", "#"]
+  },
+  "go": {
+    "extensions": [".go"],
+    "tree_sitter_language": "go",
+    "chunk_types": {
+      "function_declaration": {
+        "name_field": "name"
+      },
+      "method_declaration": {
+        "name_field": "name"
+      },
+      "type_declaration": {
+        "name_field": "name"
+      },
+      "interface_type": {
+        "name_field": null
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "rust": {
+    "extensions": [".rs"],
+    "tree_sitter_language": "rust",
+    "chunk_types": {
+      "function_item": {
+        "name_field": "name"
+      },
+      "struct_item": {
+        "name_field": "name"
+      },
+      "impl_item": {
+        "name_field": "type.type_identifier"
+      },
+      "trait_item": {
+        "name_field": "name"
+      },
+      "enum_item": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "java": {
+    "extensions": [".java"],
+    "tree_sitter_language": "java",
+    "chunk_types": {
+      "method_declaration": {
+        "name_field": "name"
+      },
+      "class_declaration": {
+        "name_field": "name"
+      },
+      "interface_declaration": {
+        "name_field": "name"
+      },
+      "enum_declaration": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "cpp": {
+    "extensions": [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h"],
+    "tree_sitter_language": "cpp",
+    "chunk_types": {
+      "function_definition": {
+        "name_field": "declarator.function_declarator.declarator"
+      },
+      "class_specifier": {
+        "name_field": "name"
+      },
+      "struct_specifier": {
+        "name_field": "name"
+      },
+      "namespace_definition": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "c": {
+    "extensions": [".c", ".h"],
+    "tree_sitter_language": "c",
+    "chunk_types": {
+      "function_definition": {
+        "name_field": "declarator.function_declarator.declarator"
+      },
+      "struct_specifier": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  },
+  "csharp": {
+    "extensions": [".cs"],
+    "tree_sitter_language": "c_sharp",
+    "chunk_types": {
+      "method_declaration": {
+        "name_field": "name"
+      },
+      "class_declaration": {
+        "name_field": "name"
+      },
+      "interface_declaration": {
+        "name_field": "name"
+      },
+      "struct_declaration": {
+        "name_field": "name"
+      }
+    },
+    "comment_patterns": ["//", "/*"]
+  }
+}

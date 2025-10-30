@@ -1,0 +1,39 @@
+# Core MCP Server
+mcp>=1.0.0
+fastmcp>=0.1.0
+
+# Vector Database
+qdrant-client>=1.7.0
+
+# Embeddings
+ollama>=0.1.0
+httpx>=0.24.0
+
+# AST Parsing
+tree-sitter>=0.20.0
+tree-sitter-python>=0.20.0
+tree-sitter-javascript>=0.20.0
+tree-sitter-typescript>=0.20.0
+tree-sitter-php>=0.22.0
+tree-sitter-go>=0.20.0
+tree-sitter-rust>=0.20.0
+tree-sitter-java>=0.20.0
+tree-sitter-cpp>=0.20.0
+tree-sitter-c>=0.20.0
+tree-sitter-c-sharp>=0.20.0
+
+# Incremental Indexing
+blake3>=0.3.0
+watchdog>=3.0.0
+
+# Utilities
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+gitignore-parser>=0.1.0
+tqdm>=4.65.0
+
+# Development
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+ruff>=0.1.0
