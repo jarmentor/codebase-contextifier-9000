@@ -1,6 +1,7 @@
 """Qdrant vector database client wrapper for code embeddings."""
 
 import logging
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
@@ -8,6 +9,21 @@ from qdrant_client.http import models
 from qdrant_client.http.models import Distance, PointStruct, VectorParams
 
 logger = logging.getLogger(__name__)
+
+
+def hex_to_uuid(hex_str: str) -> str:
+    """Convert a hexadecimal string to a UUID format.
+
+    Args:
+        hex_str: Hexadecimal string (16 or 32 characters)
+
+    Returns:
+        UUID string
+    """
+    # Pad to 32 characters if needed
+    hex_str = hex_str.ljust(32, '0')
+    # Insert hyphens to make it a valid UUID format
+    return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
 
 
 class CodeVectorDB:
@@ -82,10 +98,16 @@ class CodeVectorDB:
 
         points = []
         for chunk, embedding in zip(chunks, embeddings):
+            # Convert hex ID to UUID format for Qdrant
+            chunk_id = chunk["id"]
+            uuid_id = hex_to_uuid(chunk_id)
+
             point = PointStruct(
-                id=chunk["id"],
+                id=uuid_id,
                 vector=embedding,
                 payload={
+                    "chunk_id": chunk_id,  # Store original hex ID in payload for reference
+                    "repo_name": chunk.get("repo_name", ""),
                     "file_path": chunk.get("file_path", ""),
                     "start_line": chunk.get("start_line", 0),
                     "end_line": chunk.get("end_line", 0),
@@ -113,6 +135,7 @@ class CodeVectorDB:
         self,
         query_vector: List[float],
         limit: int = 10,
+        repo_name_filter: Optional[str] = None,
         language_filter: Optional[str] = None,
         file_path_filter: Optional[str] = None,
         chunk_type_filter: Optional[str] = None,
@@ -122,6 +145,7 @@ class CodeVectorDB:
         Args:
             query_vector: Embedding vector of the search query
             limit: Maximum number of results to return
+            repo_name_filter: Filter by repository name
             language_filter: Filter by programming language
             file_path_filter: Filter by file path (supports wildcards)
             chunk_type_filter: Filter by chunk type (function, class, etc.)
@@ -131,6 +155,14 @@ class CodeVectorDB:
         """
         # Build filter conditions
         must_conditions = []
+
+        if repo_name_filter:
+            must_conditions.append(
+                models.FieldCondition(
+                    key="repo_name",
+                    match=models.MatchValue(value=repo_name_filter),
+                )
+            )
 
         if language_filter:
             must_conditions.append(

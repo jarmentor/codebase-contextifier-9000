@@ -26,6 +26,7 @@ class SearchTool:
         self,
         query: str,
         limit: int = 10,
+        repo_name: Optional[str] = None,
         language: Optional[str] = None,
         file_path_filter: Optional[str] = None,
         chunk_type: Optional[str] = None,
@@ -35,6 +36,7 @@ class SearchTool:
         Args:
             query: Natural language search query
             limit: Maximum number of results to return (default: 10)
+            repo_name: Filter by repository name (searches all repos if not specified)
             language: Filter by programming language (e.g., 'python', 'typescript')
             file_path_filter: Filter by file path pattern (e.g., 'src/components')
             chunk_type: Filter by chunk type (e.g., 'function', 'class')
@@ -43,7 +45,7 @@ class SearchTool:
             Dictionary with search results
         """
         try:
-            logger.info(f"Searching for: {query}")
+            logger.info(f"Searching for: {query}" + (f" in repo: {repo_name}" if repo_name else " (all repos)"))
 
             # Generate embedding for the query
             query_embeddings = await self.embeddings.generate_embeddings([query])
@@ -53,6 +55,7 @@ class SearchTool:
             results = self.vector_db.search(
                 query_vector=query_vector,
                 limit=limit,
+                repo_name_filter=repo_name,
                 language_filter=language,
                 file_path_filter=file_path_filter,
                 chunk_type_filter=chunk_type,
@@ -65,6 +68,7 @@ class SearchTool:
                     {
                         "rank": i,
                         "score": round(result["score"], 4),
+                        "repo": result.get("repo_name", "unknown"),
                         "file": result["file_path"],
                         "lines": f"{result['start_line']}-{result['end_line']}",
                         "language": result["language"],
@@ -80,6 +84,7 @@ class SearchTool:
                 "total_results": len(formatted_results),
                 "results": formatted_results,
                 "filters": {
+                    "repo_name": repo_name,
                     "language": language,
                     "file_path": file_path_filter,
                     "chunk_type": chunk_type,

@@ -26,6 +26,9 @@ tree-sitter-c-sharp>=0.20.0
 blake3>=0.3.0
 watchdog>=3.0.0
 
+# Docker Integration (for spawning indexer containers)
+docker>=7.0.0
+
 # Utilities
 pydantic>=2.0.0
 python-dotenv>=1.0.0

@@ -225,7 +225,10 @@ class OllamaEmbeddings:
             models = response.json().get("models", [])
             model_names = [m["name"] for m in models]
 
-            if self.model not in model_names:
+            # Check for exact match or match with :latest suffix
+            model_found = self.model in model_names or f"{self.model}:latest" in model_names
+
+            if not model_found:
                 logger.warning(
                     f"Model '{self.model}' not found in Ollama. "
                     f"Available models: {model_names}"

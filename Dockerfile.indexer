@@ -1,0 +1,24 @@
+# Lightweight indexer image - just indexes and exits
+FROM python:3.11-slim
+
+# Install minimal dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy only what's needed for indexing
+COPY src/ /app/src/
+COPY config/ /app/config/
+COPY scripts/ /app/scripts/
+
+# Create required directories
+RUN mkdir -p /workspace /index /cache
+
+# Run the standalone indexer script
+ENTRYPOINT ["python", "-m", "scripts.indexer"]

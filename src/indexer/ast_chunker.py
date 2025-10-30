@@ -58,6 +58,12 @@ class ASTChunker:
         "c_sharp": tscsharp,
     }
 
+    # Modules that use non-standard language function names
+    LANGUAGE_FUNCTION_OVERRIDES = {
+        "typescript": "language_typescript",
+        "php": "language_php",
+    }
+
     def __init__(self, max_chunk_size: int = 2048):
         """Initialize AST chunker.
 
@@ -81,19 +87,28 @@ class ASTChunker:
 
             try:
                 # Get the language module
-                if ts_lang_name in self.LANGUAGE_MODULES:
-                    module = self.LANGUAGE_MODULES[ts_lang_name]
-                    language = Language(module.language())
-                    self.languages[lang_name] = language
-
-                    # Create parser
-                    parser = Parser()
-                    parser.language = language
-                    self.parsers[lang_name] = parser
-
-                    logger.debug(f"Initialized parser for {lang_name}")
-                else:
+                module = self.LANGUAGE_MODULES.get(ts_lang_name)
+                if not module:
                     logger.warning(f"No module found for language: {ts_lang_name}")
+                    continue
+
+                # Get the language function (either standard or override)
+                lang_func_name = self.LANGUAGE_FUNCTION_OVERRIDES.get(ts_lang_name, "language")
+                lang_func = getattr(module, lang_func_name, None)
+
+                if not lang_func:
+                    logger.warning(f"Module {ts_lang_name} has no function '{lang_func_name}'")
+                    continue
+
+                # Create language and parser
+                language = Language(lang_func())
+                self.languages[lang_name] = language
+
+                parser = Parser()
+                parser.language = language
+                self.parsers[lang_name] = parser
+
+                logger.debug(f"Initialized parser for {lang_name}")
 
             except Exception as e:
                 logger.error(f"Error initializing language {lang_name}: {e}")

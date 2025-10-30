@@ -18,10 +18,28 @@ from .tools.symbol_tool import SymbolTool
 from .vector_db.qdrant_client import CodeVectorDB
 
 # Configure logging
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+log_level = os.getenv("LOG_LEVEL", "INFO")
+log_file = os.getenv("LOG_FILE", "/tmp/mcp-server.log")
+
+# Create formatters and handlers
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Console handler (for Docker logs)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(log_level)
+console_handler.setFormatter(formatter)
+
+# File handler (for detailed logs)
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(log_level)
+file_handler.setFormatter(formatter)
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(log_level)
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
@@ -218,32 +236,13 @@ async def initialize_components():
         raise
 
 
-@mcp.tool
-async def index_repository(
-    repo_path: str = "/workspace",
-    exclude_patterns: Optional[list[str]] = None,
-    incremental: bool = True,
-) -> dict:
-    """Index a code repository with AST-aware chunking and embeddings.
-
-    Args:
-        repo_path: Path to the repository to index (default: /workspace)
-        exclude_patterns: List of glob patterns to exclude (e.g., ["*.test.js", "node_modules/*"])
-        incremental: Use incremental indexing (only re-index changed files)
-
-    Returns:
-        Dictionary with indexing results including number of files and chunks indexed
-    """
-    if not index_tool:
-        return {"success": False, "error": "Server not initialized"}
-
-    return await index_tool.index_repository(repo_path, exclude_patterns, incremental)
 
 
-@mcp.tool
+@mcp.tool()
 async def search_code(
     query: str,
     limit: int = 10,
+    repo_name: Optional[str] = None,
     language: Optional[str] = None,
     file_path_filter: Optional[str] = None,
     chunk_type: Optional[str] = None,
@@ -253,6 +252,7 @@ async def search_code(
     Args:
         query: Natural language search query (e.g., "authentication logic", "error handling")
         limit: Maximum number of results to return (default: 10)
+        repo_name: Filter by repository name (searches all repos if not specified)
         language: Filter by programming language (e.g., "python", "typescript", "php")
         file_path_filter: Filter by file path pattern (e.g., "src/components")
         chunk_type: Filter by chunk type (e.g., "function", "class", "method")
@@ -263,10 +263,10 @@ async def search_code(
     if not search_tool:
         return {"success": False, "error": "Server not initialized"}
 
-    return await search_tool.search_code(query, limit, language, file_path_filter, chunk_type)
+    return await search_tool.search_code(query, limit, repo_name, language, file_path_filter, chunk_type)
 
 
-@mcp.tool
+@mcp.tool()
 def get_symbols(
     file_path: str,
     symbol_type: Optional[str] = None,
@@ -286,7 +286,7 @@ def get_symbols(
     return symbol_tool.get_symbols(file_path, symbol_type)
 
 
-@mcp.tool
+@mcp.tool()
 def get_indexing_status() -> dict:
     """Get statistics about the current index state.
 
@@ -313,7 +313,7 @@ def get_indexing_status() -> dict:
         return {"success": False, "error": str(e)}
 
 
-@mcp.tool
+@mcp.tool()
 def clear_index() -> dict:
     """Clear the entire index (vector database and metadata).
 
@@ -337,7 +337,7 @@ def clear_index() -> dict:
         return {"success": False, "error": str(e)}
 
 
-@mcp.tool
+@mcp.tool()
 def get_watcher_status() -> dict:
     """Get status of the file watcher.
 
@@ -361,7 +361,7 @@ def get_watcher_status() -> dict:
     }
 
 
-@mcp.tool
+@mcp.tool()
 def health_check() -> dict:
     """Check health status of all components.
 
@@ -391,22 +391,132 @@ def health_check() -> dict:
         return {"success": False, "error": str(e)}
 
 
-# Server lifecycle
-@mcp.on_startup
-async def startup():
-    """Run initialization on server startup."""
-    global watcher_task, file_watcher
 
-    await initialize_components()
 
-    # Start file watcher if initialized
-    if file_watcher is not None:
-        logger.info("Starting file watcher...")
-        watcher_task = asyncio.create_task(file_watcher.run_async())
-        logger.info("File watcher running in background")
+@mcp.tool()
+def get_job_status(job_id: str) -> dict:
+    """Get the status and progress of an indexing job.
+
+    Args:
+        job_id: Job identifier returned from start_indexing_job
+
+    Returns:
+        Dictionary with job status and progress information
+    """
+    if not index_tool:
+        return {"success": False, "error": "Server not initialized"}
+
+    job = index_tool.job_manager.get_job(job_id)
+    if not job:
+        return {"success": False, "error": f"Job {job_id} not found"}
+
+    return {
+        "success": True,
+        **index_tool.job_manager.get_status_dict(job),
+    }
+
+
+@mcp.tool()
+def list_indexing_jobs() -> dict:
+    """List all indexing jobs (past and present).
+
+    Returns:
+        Dictionary with list of all jobs and their statuses
+    """
+    if not index_tool:
+        return {"success": False, "error": "Server not initialized"}
+
+    jobs = index_tool.job_manager.list_jobs()
+    job_list = [index_tool.job_manager.get_status_dict(job) for job in jobs]
+
+    return {
+        "success": True,
+        "total_jobs": len(job_list),
+        "jobs": job_list,
+    }
+
+
+@mcp.tool()
+async def cancel_indexing_job(job_id: str) -> dict:
+    """Cancel a running indexing job.
+
+    Args:
+        job_id: Job identifier to cancel
+
+    Returns:
+        Dictionary indicating success or failure
+    """
+    if not index_tool:
+        return {"success": False, "error": "Server not initialized"}
+
+    cancelled = await index_tool.job_manager.cancel_job(job_id)
+
+    if cancelled:
+        return {
+            "success": True,
+            "message": f"Job {job_id} cancelled successfully",
+        }
+    else:
+        return {
+            "success": False,
+            "error": f"Job {job_id} not found or already completed",
+        }
+
+
+@mcp.tool()
+async def index_repository(
+    host_path: str,
+    repo_name: Optional[str] = None,
+    incremental: bool = True,
+    exclude_patterns: Optional[str] = None,
+) -> dict:
+    """Index a repository from any directory on the host machine.
+
+    The MCP server spawns a lightweight indexer container that mounts the specified
+    directory and indexes it to Qdrant. This allows you to index any repo on your
+    system without manually mounting it.
+
+    By default, respects .gitignore files. You can specify additional patterns to exclude.
+
+    Args:
+        host_path: Absolute path on host machine to repository (e.g., "/Users/you/projects/my-app")
+        repo_name: Unique identifier for this repository (defaults to directory name)
+        incremental: Use incremental indexing (only re-index changed files, default: true)
+        exclude_patterns: Comma-separated glob patterns to exclude (e.g., "wp-content/plugins/*,node_modules/*,vendor/*")
+
+    Returns:
+        Dictionary with job information including job_id for tracking progress
+
+    Example:
+        # Index a WordPress site, excluding plugins and uploads
+        result = await index_repository(
+            host_path="/Users/you/projects/my-site",
+            repo_name="my-site",
+            exclude_patterns="wp-content/plugins/*,wp-content/uploads/*,wp-includes/*"
+        )
+        job_id = result["job_id"]
+
+        # Check progress
+        status = await get_job_status(job_id)
+    """
+    if not index_tool:
+        return {"success": False, "error": "Server not initialized"}
+
+    return await index_tool.start_container_indexing(
+        host_path=host_path,
+        repo_name=repo_name,
+        incremental=incremental,
+        exclude_patterns=exclude_patterns,
+    )
 
 
 if __name__ == "__main__":
     # Run the server
     logger.info("Starting Codebase Contextifier 9000 MCP Server...")
+
+    # Initialize components before starting server
+    import asyncio
+    asyncio.run(initialize_components())
+
+    # Note: File watcher will be started by FastMCP's event loop if enabled
     mcp.run()
