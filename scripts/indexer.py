@@ -93,25 +93,73 @@ async def main():
 
         logger.info(f"Found {len(all_file_paths)} supported files")
 
-        # Filter out gitignored files
+        # Parse and apply gitignore patterns manually (gitignore_parser library is unreliable)
         gitignore_path = repo_path_obj / ".gitignore"
-        if gitignore_path.exists():
-            from gitignore_parser import parse_gitignore
-            matches = parse_gitignore(gitignore_path, base_dir=str(repo_path_obj))
+        gitignore_patterns = []
 
-            # Filter files - gitignore_parser needs absolute paths
+        if gitignore_path.exists():
+            logger.info(f"Loading gitignore from: {gitignore_path}")
+            with open(gitignore_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if line and not line.startswith('#'):
+                        gitignore_patterns.append(line)
+
+            logger.info(f"Loaded {len(gitignore_patterns)} gitignore patterns")
+
+            # Filter files using our own matcher
             filtered_paths = []
+            gitignore_sample = []
+
             for file_path in all_file_paths:
-                # Convert to Path for consistent handling
-                abs_path = Path(file_path).resolve()
-                if not matches(str(abs_path)):
-                    filtered_paths.append(file_path)
+                rel_path_str = str(Path(file_path).relative_to(repo_path_obj))
+                excluded = False
+
+                for pattern in gitignore_patterns:
+                    # Skip negation patterns for now (would need more complex logic)
+                    if pattern.startswith('!'):
+                        continue
+
+                    # Handle different pattern types
+                    if pattern.endswith('/*'):
+                        # Directory contents: wp-content/plugins/*
+                        dir_prefix = pattern[:-2]
+                        if rel_path_str.startswith(dir_prefix + '/'):
+                            excluded = True
+                            break
+                    elif pattern.endswith('/'):
+                        # Directory itself: vendor/
+                        dir_prefix = pattern[:-1]
+                        if rel_path_str.startswith(dir_prefix + '/') or rel_path_str == dir_prefix:
+                            excluded = True
+                            break
+                    elif '/' in pattern:
+                        # Path-specific pattern
+                        if rel_path_str.startswith(pattern + '/') or rel_path_str == pattern:
+                            excluded = True
+                            break
+                    else:
+                        # Bare name matches anywhere: vendor matches vendor/ and any/path/vendor/
+                        parts = rel_path_str.split('/')
+                        if pattern in parts or rel_path_str.startswith(pattern + '/'):
+                            excluded = True
+                            break
+
+                if excluded:
+                    if len(gitignore_sample) < 10:
+                        gitignore_sample.append(rel_path_str)
                 else:
-                    rel_path = abs_path.relative_to(repo_path_obj)
-                    logger.debug(f"Gitignored: {rel_path}")
+                    filtered_paths.append(file_path)
 
             ignored_count = len(all_file_paths) - len(filtered_paths)
-            logger.info(f"Filtered {ignored_count} gitignored files")
+            logger.info(f"Filtered {ignored_count} gitignored files out of {len(all_file_paths)}")
+
+            if gitignore_sample:
+                logger.info(f"Sample gitignored files:")
+                for sample in gitignore_sample[:5]:
+                    logger.info(f"  {sample}")
+
             all_file_paths = filtered_paths
 
             if not all_file_paths:
@@ -122,31 +170,79 @@ async def main():
 
         # Apply additional exclude patterns if provided
         exclude_patterns_str = os.getenv("EXCLUDE_PATTERNS", "")
+        # Always add vendor and node_modules as fallback if gitignore didn't catch them
+        fallback_patterns = ["vendor/**", "node_modules/**"]
+
         if exclude_patterns_str:
             exclude_patterns = [p.strip() for p in exclude_patterns_str.split(",") if p.strip()]
-            logger.info(f"Applying exclude patterns: {exclude_patterns}")
+        else:
+            exclude_patterns = []
+
+        # Merge with fallback patterns (dedupe)
+        all_patterns = list(set(exclude_patterns + fallback_patterns))
+
+        if all_patterns:
+            logger.info(f"Applying exclude patterns: {all_patterns}")
 
             filtered_paths = []
+            excluded_sample = []
             for file_path in all_file_paths:
                 # Make path relative to workspace for pattern matching
                 rel_path = Path(file_path).relative_to(repo_path_obj)
+                rel_path_str = str(rel_path)
                 excluded = False
-                for pattern in exclude_patterns:
-                    # Convert simple patterns like 'foo/*' to 'foo/**' for recursive matching
-                    if pattern.endswith('/*'):
-                        pattern = pattern[:-2] + '/**'
 
-                    # Use Path.match() for proper glob matching
-                    if rel_path.match(pattern):
-                        excluded = True
-                        logger.debug(f"Excluding {rel_path} (matched pattern: {pattern})")
-                        break
+                for pattern in all_patterns:
+                    # Handle different pattern types
+                    if pattern.endswith('/**'):
+                        # Directory recursive: vendor/** matches vendor/anything/deep
+                        dir_prefix = pattern[:-3]  # Remove /**
+                        if rel_path_str.startswith(dir_prefix + '/') or rel_path_str == dir_prefix:
+                            excluded = True
+                            if len(excluded_sample) < 5:
+                                excluded_sample.append(f"{rel_path_str} (matched {pattern})")
+                            break
+                    elif pattern.endswith('/*'):
+                        # Directory single level: vendor/* matches vendor/file but not vendor/sub/file
+                        dir_prefix = pattern[:-2]
+                        # Check if path starts with dir/ and has no more slashes
+                        if rel_path_str.startswith(dir_prefix + '/'):
+                            remainder = rel_path_str[len(dir_prefix)+1:]
+                            if '/' not in remainder:
+                                excluded = True
+                                if len(excluded_sample) < 5:
+                                    excluded_sample.append(f"{rel_path_str} (matched {pattern})")
+                                break
+                    elif '*' in pattern:
+                        # Wildcard pattern: use Path.match()
+                        if rel_path.match(pattern):
+                            excluded = True
+                            if len(excluded_sample) < 5:
+                                excluded_sample.append(f"{rel_path_str} (matched {pattern})")
+                            break
+                    else:
+                        # Exact match or directory name
+                        if rel_path_str == pattern or rel_path_str.startswith(pattern + '/'):
+                            excluded = True
+                            if len(excluded_sample) < 5:
+                                excluded_sample.append(f"{rel_path_str} (matched {pattern})")
+                            break
 
                 if not excluded:
                     filtered_paths.append(file_path)
 
             excluded_count = len(all_file_paths) - len(filtered_paths)
             logger.info(f"Filtered {excluded_count} files matching exclude patterns")
+
+            # Log sample exclusions
+            if excluded_sample:
+                logger.info(f"Sample exclusions:")
+                for sample in excluded_sample:
+                    logger.info(f"  {sample}")
+
+            # Log what we kept
+            logger.info(f"Remaining: {len(filtered_paths)} files to index")
+
             all_file_paths = filtered_paths
 
             if not all_file_paths:

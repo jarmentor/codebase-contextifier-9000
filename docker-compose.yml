@@ -18,6 +18,16 @@ services:
       retries: 5
       start_period: 20s
 
+  # Indexer image (built but not run as a service - spawned on-demand by mcp-server)
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile.indexer
+    image: codebase-contextifier-9000-indexer
+    # Don't run as a service - this just ensures the image is built
+    deploy:
+      replicas: 0
+
   # MCP Server for semantic code search
   mcp-server:
     build:
