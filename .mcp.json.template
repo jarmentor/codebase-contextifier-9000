@@ -4,7 +4,7 @@
       "command": "sh",
       "args": [
         "-c",
-        "docker run --rm -i --network codebase-contextifier-9000_default -v \"$(pwd):/workspace:ro\" -v codebase-contextifier-9000_index_data:/index -v codebase-contextifier-9000_cache_data:/cache -v /var/run/docker.sock:/var/run/docker.sock -e QDRANT_HOST=codebase-qdrant -e QDRANT_PORT=6333 -e OLLAMA_HOST=http://host.docker.internal:11434 -e EMBEDDING_MODEL=nomic-embed-text -e INDEX_PATH=/index -e CACHE_PATH=/cache -e WORKSPACE_PATH=/workspace -e REPO_NAME=\"$(basename \"$(pwd)\")\" -e LOG_LEVEL=INFO -e ENABLE_FILE_WATCHER=false --add-host host.docker.internal:host-gateway codebase-contextifier-9000-mcp-server python -m src.server"
+        "docker run --rm -i --network codebase-contextifier-9000_default -v \"$(pwd):/workspace:ro\" -v codebase-contextifier-9000_index_data:/index -v codebase-contextifier-9000_cache_data:/cache -v /var/run/docker.sock:/var/run/docker.sock -e QDRANT_HOST=codebase-qdrant -e QDRANT_PORT=6333 -e OLLAMA_HOST=http://host.docker.internal:11434 -e EMBEDDING_MODEL=embeddinggemma:latest -e INDEX_PATH=/index -e CACHE_PATH=/cache -e WORKSPACE_PATH=/workspace -e REPO_NAME=\"$(basename \"$(pwd)\")\" -e LOG_LEVEL=INFO -e ENABLE_FILE_WATCHER=true -e MAX_CHUNK_SIZE=1500 -e MAX_CONCURRENT_EMBEDDINGS=4 -e BATCH_SIZE=32 --add-host host.docker.internal:host-gateway codebase-contextifier-9000-mcp-server python -m src.server"
       ]
     }
   }

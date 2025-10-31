@@ -508,11 +508,18 @@ class IndexingTool:
         # Create job
         job = self.job_manager.create_job(repo_name, host_path)
 
+        # Get embedding model from environment
+        import os
+        embedding_model = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+        ollama_host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+
         # Spawn indexer container
         success = await self.job_manager.spawn_indexer_container(
             job_id=job.job_id,
             host_path=host_path,
             repo_name=repo_name,
+            ollama_host=ollama_host,
+            embedding_model=embedding_model,
             incremental=incremental,
             exclude_patterns=exclude_patterns,
         )

@@ -249,6 +249,42 @@ async def main():
                 logger.error("No files remaining after exclude patterns filter")
                 sys.exit(1)
 
+        # Filter out minified files and very large files
+        logger.info("Filtering minified and large files...")
+        final_filtered = []
+        minified_count = 0
+        large_file_count = 0
+
+        for file_path in all_file_paths:
+            file_path_obj = Path(file_path)
+
+            # Skip minified files (no semantic value for search)
+            if ".min." in file_path_obj.name or file_path_obj.name.endswith(".min"):
+                minified_count += 1
+                continue
+
+            # Skip very large files (likely minified or generated)
+            try:
+                if file_path_obj.stat().st_size > 500_000:  # 500KB limit
+                    large_file_count += 1
+                    continue
+            except OSError:
+                # File might have been deleted, skip it
+                continue
+
+            final_filtered.append(file_path)
+
+        if minified_count > 0:
+            logger.info(f"Filtered {minified_count} minified files")
+        if large_file_count > 0:
+            logger.info(f"Filtered {large_file_count} large files (>500KB)")
+
+        all_file_paths = final_filtered
+
+        if not all_file_paths:
+            logger.error("No files remaining after minified/size filter")
+            sys.exit(1)
+
         # Create repo-specific merkle indexer
         repo_index_path = merkle_indexer.index_path / repo_name
         repo_merkle_indexer = MerkleTreeIndexer(repo_index_path)

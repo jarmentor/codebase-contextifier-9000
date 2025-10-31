@@ -24,6 +24,7 @@ class OllamaEmbeddings:
         cache_dir: Optional[Path] = None,
         batch_size: int = 32,
         max_concurrent: int = 4,
+        max_tokens: int = 2048,
     ):
         """Initialize Ollama embeddings client.
 
@@ -33,12 +34,14 @@ class OllamaEmbeddings:
             cache_dir: Directory for caching embeddings (None to disable)
             batch_size: Number of texts to process in parallel
             max_concurrent: Maximum concurrent requests to Ollama
+            max_tokens: Maximum token length for model (default: 2048 for nomic-embed-text)
         """
         self.host = host.rstrip("/")
         self.model = model
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.batch_size = batch_size
         self.max_concurrent = max_concurrent
+        self.max_tokens = max_tokens
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop_id: Optional[int] = None
         self._semaphore = None
@@ -48,7 +51,7 @@ class OllamaEmbeddings:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Embedding cache enabled at: {self.cache_dir}")
 
-        logger.info(f"Initialized Ollama embeddings with model: {model}")
+        logger.info(f"Initialized Ollama embeddings with model: {model} (max_tokens: {max_tokens})")
 
     def _get_client(self) -> httpx.AsyncClient:
         """Get or create an httpx client for the current event loop.
@@ -143,36 +146,96 @@ class OllamaEmbeddings:
         except Exception as e:
             logger.warning(f"Error writing cache file {cache_file}: {e}")
 
-    async def _generate_embedding_single(self, text: str) -> List[float]:
+    def _truncate_text(self, text: str) -> str:
+        """Truncate text to fit within model's token limit.
+
+        Uses a conservative estimate of 3 characters per token.
+        Leaves 20% buffer to account for tokenization overhead and safety margin.
+
+        Args:
+            text: Text to truncate
+
+        Returns:
+            Truncated text if needed, original text otherwise
+        """
+        # Very conservative estimate: 3 chars per token, with 20% safety buffer
+        # For 2048 token limit: 2048 * 3 * 0.8 = ~4915 chars max
+        max_chars = int(self.max_tokens * 3 * 0.8)
+
+        if len(text) > max_chars:
+            truncated = text[:max_chars]
+            logger.warning(
+                f"Truncated text from {len(text)} to {len(truncated)} chars "
+                f"to fit {self.max_tokens} token limit (preview: {text[:100]}...)"
+            )
+            return truncated
+
+        return text
+
+    async def _generate_embedding_single(
+        self, text: str, max_retries: int = 3
+    ) -> List[float]:
         """Generate embedding for a single text using Ollama API.
 
         Args:
             text: Text to generate embedding for
+            max_retries: Maximum number of retry attempts for transient errors
 
         Returns:
             Embedding vector
 
         Raises:
-            httpx.HTTPError: If API request fails
+            httpx.HTTPError: If API request fails after all retries
         """
+        # Truncate text to fit model's context window
+        original_len = len(text)
+        text = self._truncate_text(text)
+
         client = self._get_client()
         semaphore = self._semaphore or asyncio.Semaphore(self.max_concurrent)
 
         async with semaphore:
-            try:
-                response = await client.post(
-                    f"{self.host}/api/embeddings",
-                    json={"model": self.model, "prompt": text},
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["embedding"]
-            except httpx.HTTPError as e:
-                logger.error(f"Ollama API error: {e}")
-                raise
-            except KeyError as e:
-                logger.error(f"Unexpected API response format: {e}")
-                raise
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    response = await client.post(
+                        f"{self.host}/api/embeddings",
+                        json={"model": self.model, "prompt": text},
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["embedding"]
+                except httpx.HTTPStatusError as e:
+                    last_error = e
+                    # Retry on 500 errors (server overload) with exponential backoff
+                    if e.response.status_code >= 500 and attempt < max_retries - 1:
+                        wait_time = 2**attempt  # 1s, 2s, 4s
+                        logger.warning(
+                            f"Ollama 500 error (attempt {attempt + 1}/{max_retries}), "
+                            f"text_len={len(text)} (original={original_len}), retrying in {wait_time}s..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    # Log final failure with text details
+                    logger.error(
+                        f"Ollama API error {e.response.status_code}: text_len={len(text)} "
+                        f"(original={original_len}), preview: {text[:200]}..."
+                    )
+                    # Don't retry on 4xx errors (client errors)
+                    raise
+                except httpx.HTTPError as e:
+                    logger.error(f"Ollama API error: {e}")
+                    raise
+                except KeyError as e:
+                    logger.error(f"Unexpected API response format: {e}")
+                    raise
+
+            # If we exhausted all retries
+            logger.error(
+                f"Failed after {max_retries} attempts, text_len={len(text)} "
+                f"(original={original_len})"
+            )
+            raise last_error
 
     async def generate_embeddings(
         self, texts: List[str], use_cache: bool = True
@@ -213,16 +276,35 @@ class OllamaEmbeddings:
             )
 
             tasks = [self._generate_embedding_single(text) for text in texts_to_generate]
-            generated = await asyncio.gather(*tasks)
+            # Use return_exceptions=True to allow partial success
+            generated = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Fill in generated embeddings and cache them
+            # Skip any that failed (will be exceptions)
             gen_idx = 0
+            failed_count = 0
             for i, emb in enumerate(embeddings):
                 if emb is None:
-                    embeddings[i] = generated[gen_idx]
-                    if use_cache and self.cache_dir:
-                        self._save_cached_embedding(cache_keys[i], generated[gen_idx])
+                    result = generated[gen_idx]
+                    # Check if this embedding generation failed
+                    if isinstance(result, Exception):
+                        failed_count += 1
+                        logger.warning(
+                            f"Failed to generate embedding for chunk {i}: {result}"
+                        )
+                        # Leave as None - will be filtered out later
+                        embeddings[i] = None
+                    else:
+                        embeddings[i] = result
+                        if use_cache and self.cache_dir:
+                            self._save_cached_embedding(cache_keys[i], result)
                     gen_idx += 1
+
+            if failed_count > 0:
+                logger.warning(
+                    f"{failed_count}/{len(texts_to_generate)} embeddings failed, "
+                    f"continuing with successful ones"
+                )
 
         return embeddings
 

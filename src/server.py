@@ -9,13 +9,16 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from .indexer.ast_chunker import ASTChunker
+from .indexer.dependency_detector import DependencyDetector
 from .indexer.embeddings import OllamaEmbeddings
 from .indexer.file_watcher import CodebaseWatcher
+from .indexer.knowledge_indexer import KnowledgeIndexer
 from .indexer.merkle_tree import IncrementalIndexingSession, MerkleTreeIndexer
 from .tools.index_tool import IndexingTool
 from .tools.search_tool import SearchTool
 from .tools.symbol_tool import SymbolTool
 from .vector_db.qdrant_client import CodeVectorDB
+from .vector_db.knowledge_db import KnowledgeVectorDB
 
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -47,12 +50,14 @@ mcp = FastMCP("codebase-contextifier-9000")
 
 # Global components (initialized on startup)
 vector_db: Optional[CodeVectorDB] = None
+knowledge_db: Optional[KnowledgeVectorDB] = None
 embeddings: Optional[OllamaEmbeddings] = None
 merkle_indexer: Optional[MerkleTreeIndexer] = None
 chunker: Optional[ASTChunker] = None
 index_tool: Optional[IndexingTool] = None
 search_tool: Optional[SearchTool] = None
 symbol_tool: Optional[SymbolTool] = None
+knowledge_indexer: Optional[KnowledgeIndexer] = None
 file_watcher: Optional[CodebaseWatcher] = None
 watcher_task: Optional[asyncio.Task] = None
 
@@ -162,16 +167,20 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
 
 async def initialize_components():
     """Initialize all components on startup."""
-    global vector_db, embeddings, merkle_indexer, chunker
-    global index_tool, search_tool, symbol_tool, file_watcher, watcher_task
+    global vector_db, knowledge_db, embeddings, merkle_indexer, chunker
+    global index_tool, search_tool, symbol_tool, knowledge_indexer, file_watcher, watcher_task
 
     config = get_env_config()
     logger.info("Initializing Codebase Contextifier 9000...")
 
     try:
-        # Initialize vector database
+        # Initialize vector databases
         logger.info(f"Connecting to Qdrant at {config['qdrant_host']}:{config['qdrant_port']}")
         vector_db = CodeVectorDB(
+            host=config["qdrant_host"],
+            port=config["qdrant_port"],
+        )
+        knowledge_db = KnowledgeVectorDB(
             host=config["qdrant_host"],
             port=config["qdrant_port"],
         )
@@ -205,6 +214,7 @@ async def initialize_components():
         index_tool = IndexingTool(vector_db, embeddings, merkle_indexer, chunker)
         search_tool = SearchTool(vector_db, embeddings)
         symbol_tool = SymbolTool(chunker)
+        knowledge_indexer = KnowledgeIndexer(knowledge_db, embeddings, chunker)
 
         # Initialize file watcher if enabled
         if config["enable_watcher"]:
@@ -334,17 +344,19 @@ def get_indexing_status() -> dict:
     Returns:
         Dictionary with index statistics including number of indexed files and chunks
     """
-    if not search_tool or not merkle_indexer or not embeddings:
+    if not search_tool or not merkle_indexer or not embeddings or not knowledge_db:
         return {"success": False, "error": "Server not initialized"}
 
     try:
         vector_stats = search_tool.get_stats()
+        knowledge_stats = knowledge_db.get_stats()
         index_stats = merkle_indexer.get_stats()
         cache_stats = embeddings.get_cache_stats()
 
         return {
             "success": True,
-            "vector_db": vector_stats,
+            "code_db": vector_stats,
+            "knowledge_db": knowledge_stats,
             "index": index_stats,
             "cache": cache_stats,
         }
@@ -571,6 +583,119 @@ async def index_repository(
         incremental=incremental,
         exclude_patterns=exclude_patterns,
     )
+
+
+@mcp.tool()
+def detect_dependencies(workspace_path: Optional[str] = None) -> dict:
+    """Detect available dependencies in workspace (WordPress plugins, Composer, npm).
+
+    Args:
+        workspace_path: Optional workspace path (uses mounted workspace by default)
+
+    Returns:
+        Condensed summary with dependency names and versions
+    """
+    config = get_env_config()
+
+    # Always use mounted workspace path (host paths don't exist inside container)
+    workspace_path = config["workspace_path"]
+
+    try:
+        detector = DependencyDetector(workspace_path)
+        dependencies = detector.detect_all()
+
+        # Create condensed summaries (name + version, include slug for WP plugins)
+        condensed = {}
+        for dep_type, deps in dependencies.items():
+            condensed_list = []
+            for dep in deps:
+                item = {
+                    "name": dep.get("name", dep.get("slug", "unknown")),
+                    "version": dep.get("version", "unknown"),
+                    "type": dep.get("type", dep_type),
+                }
+                # For WordPress plugins/themes, include slug (what you use to index)
+                if "slug" in dep and dep_type in ["wordpress_plugins", "wordpress_themes"]:
+                    item["slug"] = dep["slug"]
+                condensed_list.append(item)
+            condensed[dep_type] = condensed_list
+
+        return {
+            "success": True,
+            "workspace": workspace_path,
+            **condensed,
+            "summary": {
+                "wordpress_plugins": len(condensed.get("wordpress_plugins", [])),
+                "wordpress_themes": len(condensed.get("wordpress_themes", [])),
+                "composer_packages": len(condensed.get("composer_packages", [])),
+                "npm_packages": len(condensed.get("npm_packages", [])),
+                "total": sum(len(deps) for deps in condensed.values()),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Error detecting dependencies: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def list_indexed_dependencies() -> dict:
+    """List dependencies that have already been indexed in the knowledge base.
+
+    Returns:
+        List of indexed dependencies with chunk counts
+    """
+    if not knowledge_db:
+        return {"success": False, "error": "Server not initialized"}
+
+    try:
+        dependencies = knowledge_db.list_dependencies()
+        return {
+            "success": True,
+            "dependencies": dependencies,
+            "total_dependencies": len(dependencies),
+        }
+
+    except Exception as e:
+        logger.error(f"Error listing indexed dependencies: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def index_dependencies(
+    dependency_names: list[str],
+    workspace_id: str,
+    workspace_path: Optional[str] = None,
+) -> dict:
+    """Index specific dependencies into knowledge base.
+
+    If dependency version already exists, links to workspace instead of re-indexing.
+
+    Args:
+        dependency_names: List of dependency names/slugs to index
+        workspace_id: Unique workspace identifier
+        workspace_path: Optional workspace path (uses mounted workspace by default)
+
+    Returns:
+        Result with indexing details
+    """
+    if not knowledge_indexer:
+        return {"success": False, "error": "Server not initialized"}
+
+    config = get_env_config()
+
+    # Always use mounted workspace path (host paths don't exist inside container)
+    workspace_path = config["workspace_path"]
+
+    try:
+        result = await knowledge_indexer.index_multiple(
+            dependency_names, workspace_path, workspace_id
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"Error indexing dependencies: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def run_watcher_debounce_in_thread():
