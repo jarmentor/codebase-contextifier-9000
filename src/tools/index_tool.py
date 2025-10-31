@@ -508,10 +508,14 @@ class IndexingTool:
         # Create job
         job = self.job_manager.create_job(repo_name, host_path)
 
-        # Get embedding model from environment
+        # Get configuration from environment
         import os
         embedding_model = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
         ollama_host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+        enable_graph_db = os.getenv("ENABLE_GRAPH_DB", "true").lower() == "true"
+        neo4j_uri = os.getenv("NEO4J_URI", "bolt://codebase-neo4j:7687")
+        neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+        neo4j_password = os.getenv("NEO4J_PASSWORD", "codebase123")
 
         # Spawn indexer container
         success = await self.job_manager.spawn_indexer_container(
@@ -522,6 +526,10 @@ class IndexingTool:
             embedding_model=embedding_model,
             incremental=incremental,
             exclude_patterns=exclude_patterns,
+            enable_graph_db=enable_graph_db,
+            neo4j_uri=neo4j_uri,
+            neo4j_user=neo4j_user,
+            neo4j_password=neo4j_password,
         )
 
         if success:

@@ -225,6 +225,10 @@ class JobManager:
         embedding_model: str = "nomic-embed-text",
         incremental: bool = True,
         exclude_patterns: Optional[str] = None,
+        enable_graph_db: bool = True,
+        neo4j_uri: str = "bolt://codebase-neo4j:7687",
+        neo4j_user: str = "neo4j",
+        neo4j_password: str = "codebase123",
     ) -> bool:
         """Spawn a Docker container to index a repository.
 
@@ -238,6 +242,10 @@ class JobManager:
             embedding_model: Embedding model name
             incremental: Use incremental indexing
             exclude_patterns: Comma-separated glob patterns to exclude
+            enable_graph_db: Enable Neo4j graph database
+            neo4j_uri: Neo4j connection URI
+            neo4j_user: Neo4j username
+            neo4j_password: Neo4j password
 
         Returns:
             True if container spawned successfully, False otherwise
@@ -263,6 +271,11 @@ class JobManager:
                 "CACHE_PATH": "/cache",
                 "LOG_LEVEL": "INFO",
                 "INCREMENTAL": "true" if incremental else "false",
+                # Neo4j configuration
+                "ENABLE_GRAPH_DB": "true" if enable_graph_db else "false",
+                "NEO4J_URI": neo4j_uri,
+                "NEO4J_USER": neo4j_user,
+                "NEO4J_PASSWORD": neo4j_password,
             }
 
             # Add exclude patterns if provided

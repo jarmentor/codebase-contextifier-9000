@@ -15,6 +15,113 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def chunk_to_graph_node(chunk, repo_name: str, source_collection: str = "code_chunks"):
+    """Convert a CodeChunk to a GraphNode for Neo4j."""
+    from src.graph_db.neo4j_client import GraphNode
+
+    # Determine node label based on chunk type
+    label_map = {
+        "function": "Function",
+        "method": "Method",
+        "class": "Class",
+        "interface": "Interface",
+        "module": "Module",
+    }
+    label = label_map.get(chunk.chunk_type, "Function")
+
+    # Build properties
+    properties = {
+        "name": chunk.name or "anonymous",
+        "file_path": chunk.file_path,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "repo_name": repo_name,
+        "language": chunk.language,
+        "source_collection": source_collection,
+    }
+
+    # Add chunk_type for reference
+    properties["chunk_type"] = chunk.chunk_type
+
+    # Add context if available
+    if chunk.context:
+        properties["context"] = chunk.context
+
+    return GraphNode(
+        id=chunk.id,
+        label=label,
+        properties=properties,
+        source_collection=source_collection,
+    )
+
+
+def create_external_placeholder_node(target_name: str, relationship_type: str):
+    """Create a placeholder node for external/unresolved function calls.
+
+    Args:
+        target_name: Name of the external function/class
+        relationship_type: Type of relationship (CALLS, IMPORTS, etc.)
+
+    Returns:
+        GraphNode for the external entity
+    """
+    from src.graph_db.neo4j_client import GraphNode
+
+    # Create consistent ID for external nodes (allows Neo4j MERGE to dedupe)
+    external_id = f"external_{target_name}"
+
+    # Determine label based on what it likely is
+    if relationship_type == "IMPORTS":
+        label = "ExternalModule"
+    elif relationship_type in ["EXTENDS", "IMPLEMENTS"]:
+        label = "ExternalClass"
+    else:
+        label = "ExternalFunction"
+
+    properties = {
+        "name": target_name,
+        "is_external": True,
+        "source_collection": "external",
+    }
+
+    return GraphNode(
+        id=external_id,
+        label=label,
+        properties=properties,
+        source_collection="external",
+    )
+
+
+def relationship_to_graph_relationship(rel, source_collection: str = "code_chunks"):
+    """Convert a CodeRelationship to a GraphRelationship for Neo4j."""
+    from src.graph_db.neo4j_client import GraphRelationship
+
+    # Build properties
+    properties = {
+        "line_number": rel.line_number,
+        "source_file": rel.source_file,
+        "source_name": rel.source_name,
+        "target_name": rel.target_name,
+        "is_external": rel.target_id is None,  # Mark if target is external
+    }
+
+    # Add metadata
+    if rel.metadata:
+        properties.update(rel.metadata)
+
+    # If target_id is None (external call), use placeholder ID
+    target_id = rel.target_id
+    if target_id is None:
+        target_id = f"external_{rel.target_name}"
+
+    return GraphRelationship(
+        source_id=rel.source_id,
+        target_id=target_id,
+        relationship_type=rel.relationship_type,
+        properties=properties,
+    )
+
+
 async def main():
     """Main indexer function."""
     try:
@@ -23,6 +130,7 @@ async def main():
         from src.indexer.embeddings import OllamaEmbeddings
         from src.indexer.merkle_tree import IncrementalIndexingSession, MerkleTreeIndexer
         from src.vector_db.qdrant_client import CodeVectorDB
+        from src.graph_db.neo4j_client import CodeGraphDB, GraphNode, GraphRelationship
 
         # Get configuration from environment
         workspace_path = os.getenv("WORKSPACE_PATH", "/workspace")
@@ -38,6 +146,12 @@ async def main():
         max_concurrent = int(os.getenv("MAX_CONCURRENT_EMBEDDINGS", "4"))
         incremental = os.getenv("INCREMENTAL", "true").lower() == "true"
 
+        # Neo4j configuration
+        enable_graph_db = os.getenv("ENABLE_GRAPH_DB", "true").lower() == "true"
+        neo4j_uri = os.getenv("NEO4J_URI", "bolt://codebase-neo4j:7687")
+        neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+        neo4j_password = os.getenv("NEO4J_PASSWORD", "codebase123")
+
         # Auto-generate repo_name if not provided
         if not repo_name:
             repo_name = Path(workspace_path).name
@@ -48,6 +162,9 @@ async def main():
         logger.info(f"Qdrant: {qdrant_host}:{qdrant_port}")
         logger.info(f"Ollama: {ollama_host}")
         logger.info(f"Incremental: {incremental}")
+        logger.info(f"Graph DB enabled: {enable_graph_db}")
+        if enable_graph_db:
+            logger.info(f"Neo4j: {neo4j_uri}")
 
         # Initialize components
         logger.info("Initializing components...")
@@ -66,6 +183,26 @@ async def main():
         if not await embeddings.health_check():
             logger.error("Ollama health check failed!")
             sys.exit(1)
+
+        # Initialize Neo4j graph database
+        graph_db = None
+        if enable_graph_db:
+            try:
+                logger.info("Connecting to Neo4j...")
+                graph_db = CodeGraphDB(
+                    uri=neo4j_uri,
+                    user=neo4j_user,
+                    password=neo4j_password,
+                )
+                if graph_db.verify_connectivity():
+                    logger.info("Neo4j connection successful")
+                    graph_db.create_indexes()
+                else:
+                    logger.warning("Neo4j connectivity check failed, continuing without graph DB")
+                    graph_db = None
+            except Exception as e:
+                logger.warning(f"Failed to connect to Neo4j: {e}, continuing without graph DB")
+                graph_db = None
 
         merkle_indexer = MerkleTreeIndexer(index_path)
         chunker = ASTChunker(max_chunk_size=max_chunk_size)
@@ -305,11 +442,16 @@ async def main():
                     f"{len(all_file_paths) - len(files_to_index)} cached"
                 )
 
-                # Remove deleted files from vector DB
+                # Remove deleted files from vector DB and Neo4j
                 for file_path in files_to_remove:
                     chunk_ids = session.remove_file(file_path)
                     if chunk_ids:
                         vector_db.delete_by_file_path(file_path)
+                        if graph_db:
+                            try:
+                                graph_db.delete_by_file_path(file_path, repo_name=repo_name)
+                            except Exception as e:
+                                logger.warning(f"Failed to delete graph nodes for {file_path}: {e}")
                         logger.info(f"Removed chunks for deleted file: {file_path}")
 
                 # Process changed/new files
@@ -356,6 +498,61 @@ async def main():
 
                         # Upsert to vector DB
                         vector_db.upsert_chunks(chunk_dicts, chunk_embeddings)
+
+                        # Extract and store relationships in Neo4j
+                        if graph_db:
+                            try:
+                                # First, remove old nodes for this file (in case of modifications)
+                                graph_db.delete_by_file_path(file_path, repo_name=repo_name)
+                                # Extract relationships from this file
+                                relationships = chunker.extract_relationships(
+                                    file_path, chunks=chunks
+                                )
+
+                                # Convert chunks to graph nodes
+                                graph_nodes = [
+                                    chunk_to_graph_node(chunk, repo_name)
+                                    for chunk in chunks
+                                ]
+
+                                # Create external placeholder nodes for unresolved relationships
+                                external_nodes = []
+                                for rel in relationships:
+                                    if rel.target_id is None:
+                                        external_node = create_external_placeholder_node(
+                                            rel.target_name, rel.relationship_type
+                                        )
+                                        external_nodes.append(external_node)
+
+                                # Batch create all nodes (code + external) in Neo4j
+                                all_nodes = graph_nodes + external_nodes
+                                if all_nodes:
+                                    graph_db.batch_create_nodes(all_nodes)
+                                    logger.debug(
+                                        f"Created {len(graph_nodes)} code nodes + "
+                                        f"{len(external_nodes)} external nodes in Neo4j"
+                                    )
+
+                                # Convert ALL relationships (now all have targets)
+                                graph_relationships = [
+                                    relationship_to_graph_relationship(rel)
+                                    for rel in relationships
+                                ]
+
+                                internal_count = sum(1 for rel in relationships if rel.target_id is not None)
+                                external_count = len(relationships) - internal_count
+
+                                # Batch create relationships in Neo4j
+                                if graph_relationships:
+                                    graph_db.batch_create_relationships(graph_relationships)
+                                    logger.info(
+                                        f"Created {len(graph_relationships)} relationships "
+                                        f"({internal_count} internal, {external_count} external)"
+                                    )
+
+                            except Exception as e:
+                                logger.warning(f"Failed to store graph data for {file_path}: {e}")
+                                # Continue indexing even if graph storage fails
 
                         # Update merkle tree
                         chunk_ids = [chunk.id for chunk in chunks]
@@ -427,6 +624,59 @@ async def main():
                     ]
 
                     vector_db.upsert_chunks(chunk_dicts, chunk_embeddings)
+
+                    # Extract and store relationships in Neo4j
+                    if graph_db:
+                        try:
+                            # First, remove old nodes for this file (in case of re-indexing)
+                            graph_db.delete_by_file_path(file_path, repo_name=repo_name)
+
+                            # Extract relationships from this file
+                            relationships = chunker.extract_relationships(
+                                file_path, chunks=chunks
+                            )
+
+                            # Convert chunks to graph nodes
+                            graph_nodes = [
+                                chunk_to_graph_node(chunk, repo_name)
+                                for chunk in chunks
+                            ]
+
+                            # Create external placeholder nodes for unresolved relationships
+                            external_nodes = []
+                            for rel in relationships:
+                                if rel.target_id is None:
+                                    external_node = create_external_placeholder_node(
+                                        rel.target_name, rel.relationship_type
+                                    )
+                                    external_nodes.append(external_node)
+
+                            # Batch create all nodes (code + external) in Neo4j
+                            all_nodes = graph_nodes + external_nodes
+                            if all_nodes:
+                                graph_db.batch_create_nodes(all_nodes)
+
+                            # Convert ALL relationships (now all have targets)
+                            graph_relationships = [
+                                relationship_to_graph_relationship(rel)
+                                for rel in relationships
+                            ]
+
+                            internal_count = sum(1 for rel in relationships if rel.target_id is not None)
+                            external_count = len(relationships) - internal_count
+
+                            # Batch create relationships in Neo4j
+                            if graph_relationships:
+                                graph_db.batch_create_relationships(graph_relationships)
+                                logger.info(
+                                    f"Created {len(graph_relationships)} relationships "
+                                    f"({internal_count} internal, {external_count} external)"
+                                )
+
+                        except Exception as e:
+                            logger.warning(f"Failed to store graph data for {file_path}: {e}")
+                            # Continue indexing even if graph storage fails
+
                     total_chunks += len(chunks)
                     logger.info(f"✓ Indexed {len(chunks)} chunks")
 

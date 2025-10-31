@@ -47,7 +47,9 @@ class SymbolTool:
 
             # Filter by symbol type if specified
             if symbol_type:
-                chunks = [c for c in chunks if c.chunk_type == symbol_type]
+                # Use substring matching to handle different language-specific names
+                # e.g., "function" matches "function", "function_declaration", "function_definition"
+                chunks = [c for c in chunks if symbol_type.lower() in c.chunk_type.lower()]
 
             # Format symbols
             symbols = []

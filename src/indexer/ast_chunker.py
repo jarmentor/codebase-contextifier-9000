@@ -1,7 +1,6 @@
 """AST-aware code chunking using tree-sitter for semantic boundaries."""
 
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,26 +18,10 @@ import tree_sitter_c_sharp as tscsharp
 from tree_sitter import Language, Parser
 
 from .grammars import LanguageConfig, get_language_registry
+from .models import CodeChunk, CodeRelationship
+from .relationship_extractors import ExtractorRegistry
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class CodeChunk:
-    """Represents a semantic chunk of code."""
-
-    id: str  # Blake3 hash for content-addressable storage
-    file_path: str
-    start_line: int
-    end_line: int
-    start_byte: int
-    end_byte: int
-    language: str
-    chunk_type: str  # function, class, method, etc.
-    name: Optional[str]  # identifier name if available
-    content: str
-    context: str  # surrounding context (e.g., class name for methods)
-    repo_path: str  # relative path from repo root
 
 
 class ASTChunker:
@@ -382,3 +365,408 @@ class ASTChunker:
 
         logger.info(f"Extracted {len(all_chunks)} total chunks from {directory}")
         return all_chunks
+
+    def extract_relationships(
+        self, file_path: str, chunks: Optional[List[CodeChunk]] = None, repo_root: Optional[str] = None
+    ) -> List[CodeRelationship]:
+        """Extract code relationships from a file.
+
+        Args:
+            file_path: Path to the file to analyze
+            chunks: Pre-extracted chunks from the file (will extract if not provided)
+            repo_root: Root directory of the repository
+
+        Returns:
+            List of code relationships
+        """
+        # Detect language
+        language = self.registry.detect_language(file_path)
+        if not language:
+            logger.debug(f"Unsupported file type for relationship extraction: {file_path}")
+            return []
+
+        if language not in self.parsers:
+            logger.debug(f"Parser not available for {language}")
+            return []
+
+        # Get chunks if not provided
+        if chunks is None:
+            chunks = self.chunk_file(file_path, repo_root)
+
+        # Read file
+        try:
+            with open(file_path, "rb") as f:
+                source_code = f.read()
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {e}")
+            return []
+
+        # Parse with tree-sitter
+        try:
+            parser = self.parsers[language]
+            tree = parser.parse(source_code)
+            root_node = tree.root_node
+
+            relationships = []
+
+            # Create chunk index for quick lookup
+            chunk_map = {chunk.id: chunk for chunk in chunks}
+
+            # Extract different types of relationships
+            relationships.extend(self._extract_function_calls(root_node, source_code, file_path, language, chunks, chunk_map))
+            relationships.extend(self._extract_imports(root_node, source_code, file_path, language))
+            relationships.extend(self._extract_inheritance(root_node, source_code, file_path, language, chunks, chunk_map))
+            relationships.extend(self._extract_class_membership(chunks))
+
+            logger.info(f"Extracted {len(relationships)} relationships from {file_path}")
+            return relationships
+
+        except Exception as e:
+            logger.error(f"Error extracting relationships from {file_path}: {e}")
+            return []
+
+    def _extract_function_calls(
+        self,
+        root_node: Any,
+        source_code: bytes,
+        file_path: str,
+        language: str,
+        chunks: List[CodeChunk],
+        chunk_map: Dict[str, CodeChunk],
+    ) -> List[CodeRelationship]:
+        """Extract function/method call relationships.
+
+        Args:
+            root_node: Root AST node
+            source_code: Source code bytes
+            file_path: File path
+            language: Programming language
+            chunks: List of code chunks
+            chunk_map: Chunk ID to chunk mapping
+
+        Returns:
+            List of CALLS relationships
+        """
+        relationships = []
+
+        # Get language-specific extractor
+        extractor = ExtractorRegistry.get_extractor(language)
+        if not extractor:
+            logger.debug(f"No relationship extractor for language: {language}")
+            return relationships
+
+        # Get call node types from extractor
+        call_node_types = extractor.get_call_node_types()
+        if not call_node_types:
+            return relationships
+
+        # Find all call expressions
+        call_nodes = self._find_nodes_by_type(root_node, call_node_types)
+
+        for call_node in call_nodes:
+            try:
+                # Find the containing chunk (caller)
+                caller_chunk = self._find_containing_chunk(call_node, chunks)
+                if not caller_chunk:
+                    continue
+
+                # Extract callee name using language-specific extractor
+                callee_name = extractor.extract_call_target_name(call_node)
+                if not callee_name:
+                    continue
+
+                # Try to find target chunk (may be external/unresolved)
+                target_chunk = None
+                for chunk in chunks:
+                    if chunk.name == callee_name and chunk.chunk_type in ["function_definition", "method_definition"]:
+                        target_chunk = chunk
+                        break
+
+                relationship = CodeRelationship(
+                    source_id=caller_chunk.id,
+                    source_name=caller_chunk.name or "anonymous",
+                    source_type=caller_chunk.chunk_type,
+                    source_file=file_path,
+                    target_id=target_chunk.id if target_chunk else None,
+                    target_name=callee_name,
+                    target_type="function" if not target_chunk else target_chunk.chunk_type,
+                    relationship_type="CALLS",
+                    line_number=call_node.start_point[0] + 1,
+                    metadata={
+                        "is_resolved": target_chunk is not None,
+                        "language": language,
+                    },
+                )
+                relationships.append(relationship)
+
+            except Exception as e:
+                logger.debug(f"Error processing call node: {e}")
+                continue
+
+        return relationships
+
+    def _extract_imports(
+        self, root_node: Any, source_code: bytes, file_path: str, language: str
+    ) -> List[CodeRelationship]:
+        """Extract import/require relationships.
+
+        Args:
+            root_node: Root AST node
+            source_code: Source code bytes
+            file_path: File path
+            language: Programming language
+
+        Returns:
+            List of IMPORTS relationships
+        """
+        relationships = []
+
+        # Get language-specific extractor
+        extractor = ExtractorRegistry.get_extractor(language)
+        if not extractor:
+            logger.debug(f"No relationship extractor for language: {language}")
+            return relationships
+
+        # Get import node types from extractor
+        import_node_types = extractor.get_import_node_types()
+        if not import_node_types:
+            return relationships
+
+        import_nodes = self._find_nodes_by_type(root_node, import_node_types)
+
+        for import_node in import_nodes:
+            try:
+                # Extract import info using language-specific extractor
+                import_info = extractor.extract_import_info(import_node, source_code)
+                if not import_info:
+                    continue
+
+                relationship = CodeRelationship(
+                    source_id=f"file:{file_path}",
+                    source_name=file_path,
+                    source_type="file",
+                    source_file=file_path,
+                    target_id=None,  # External module
+                    target_name=import_info["module"],
+                    target_type="module",
+                    relationship_type="IMPORTS",
+                    line_number=import_node.start_point[0] + 1,
+                    metadata={
+                        "import_alias": import_info.get("alias"),
+                        "is_relative": import_info.get("is_relative", False),
+                        "imported_names": import_info.get("names", []),
+                        "language": language,
+                    },
+                )
+                relationships.append(relationship)
+
+            except Exception as e:
+                logger.debug(f"Error processing import node: {e}")
+                continue
+
+        return relationships
+
+    def _extract_inheritance(
+        self,
+        root_node: Any,
+        source_code: bytes,
+        file_path: str,
+        language: str,
+        chunks: List[CodeChunk],
+        chunk_map: Dict[str, CodeChunk],
+    ) -> List[CodeRelationship]:
+        """Extract class inheritance and interface implementation relationships.
+
+        Args:
+            root_node: Root AST node
+            source_code: Source code bytes
+            file_path: File path
+            language: Programming language
+            chunks: List of code chunks
+            chunk_map: Chunk ID to chunk mapping
+
+        Returns:
+            List of EXTENDS and IMPLEMENTS relationships
+        """
+        relationships = []
+
+        # Get language-specific extractor
+        extractor = ExtractorRegistry.get_extractor(language)
+        if not extractor:
+            logger.debug(f"No relationship extractor for language: {language}")
+            return relationships
+
+        for class_chunk in chunks:
+            if class_chunk.chunk_type not in ["class_definition", "class_declaration"]:
+                continue
+
+            try:
+                # Find the AST node for this class
+                class_node = self._find_node_at_position(
+                    root_node, class_chunk.start_byte, class_chunk.end_byte
+                )
+                if not class_node:
+                    continue
+
+                # Extract inheritance info using language-specific extractor
+                inheritance_info = extractor.extract_inheritance_info(class_node, source_code)
+
+                # Create EXTENDS relationships for base classes
+                for base_class in inheritance_info.get("extends", []):
+                    # Try to find target class in same file
+                    target_chunk = None
+                    for chunk in chunks:
+                        if chunk.name == base_class and chunk.chunk_type in ["class_definition", "class_declaration"]:
+                            target_chunk = chunk
+                            break
+
+                    relationship = CodeRelationship(
+                        source_id=class_chunk.id,
+                        source_name=class_chunk.name or "anonymous",
+                        source_type=class_chunk.chunk_type,
+                        source_file=file_path,
+                        target_id=target_chunk.id if target_chunk else None,
+                        target_name=base_class,
+                        target_type="class",
+                        relationship_type="EXTENDS",
+                        line_number=class_chunk.start_line,
+                        metadata={
+                            "is_resolved": target_chunk is not None,
+                            "language": language,
+                        },
+                    )
+                    relationships.append(relationship)
+
+                # Create IMPLEMENTS relationships for interfaces
+                for interface in inheritance_info.get("implements", []):
+                    relationship = CodeRelationship(
+                        source_id=class_chunk.id,
+                        source_name=class_chunk.name or "anonymous",
+                        source_type=class_chunk.chunk_type,
+                        source_file=file_path,
+                        target_id=None,  # Interfaces may be external
+                        target_name=interface,
+                        target_type="interface",
+                        relationship_type="IMPLEMENTS",
+                        line_number=class_chunk.start_line,
+                        metadata={
+                            "language": language,
+                        },
+                    )
+                    relationships.append(relationship)
+
+            except Exception as e:
+                logger.debug(f"Error extracting inheritance for class {class_chunk.name}: {e}")
+                continue
+
+        return relationships
+
+    def _extract_class_membership(self, chunks: List[CodeChunk]) -> List[CodeRelationship]:
+        """Extract BELONGS_TO relationships for methods within classes.
+
+        Args:
+            chunks: List of code chunks
+
+        Returns:
+            List of BELONGS_TO relationships
+        """
+        relationships = []
+
+        for chunk in chunks:
+            # Methods and nested classes belong to their parent class
+            if chunk.context and chunk.chunk_type in ["method_definition", "function_definition"]:
+                # Parse context to find parent class
+                # Context format: "class_definition:ClassName > method_definition:methodName"
+                context_parts = chunk.context.split(" > ")
+                if context_parts:
+                    parent_info = context_parts[0].split(":")
+                    if len(parent_info) == 2:
+                        parent_type, parent_name = parent_info
+
+                        # Find parent chunk
+                        parent_chunk = None
+                        for other_chunk in chunks:
+                            if other_chunk.name == parent_name and other_chunk.chunk_type == parent_type:
+                                parent_chunk = other_chunk
+                                break
+
+                        if parent_chunk:
+                            relationship = CodeRelationship(
+                                source_id=chunk.id,
+                                source_name=chunk.name or "anonymous",
+                                source_type=chunk.chunk_type,
+                                source_file=chunk.file_path,
+                                target_id=parent_chunk.id,
+                                target_name=parent_name,
+                                target_type=parent_type,
+                                relationship_type="BELONGS_TO",
+                                line_number=chunk.start_line,
+                                metadata={
+                                    "context": chunk.context,
+                                },
+                            )
+                            relationships.append(relationship)
+
+        return relationships
+
+    # Helper methods
+
+    def _find_nodes_by_type(self, node: Any, node_types: List[str]) -> List[Any]:
+        """Recursively find all nodes of specific types.
+
+        Args:
+            node: Root node to search from
+            node_types: List of node types to find
+
+        Returns:
+            List of matching nodes
+        """
+        matches = []
+
+        if node.type in node_types:
+            matches.append(node)
+
+        for child in node.children:
+            matches.extend(self._find_nodes_by_type(child, node_types))
+
+        return matches
+
+    def _find_containing_chunk(self, node: Any, chunks: List[CodeChunk]) -> Optional[CodeChunk]:
+        """Find the chunk that contains a given AST node.
+
+        Args:
+            node: AST node
+            chunks: List of code chunks
+
+        Returns:
+            Containing chunk or None
+        """
+        node_start = node.start_byte
+        node_end = node.end_byte
+
+        for chunk in chunks:
+            if chunk.start_byte <= node_start and chunk.end_byte >= node_end:
+                return chunk
+
+        return None
+
+    def _find_node_at_position(self, root_node: Any, start_byte: int, end_byte: int) -> Optional[Any]:
+        """Find AST node at a specific byte position.
+
+        Args:
+            root_node: Root node to search from
+            start_byte: Start byte position
+            end_byte: End byte position
+
+        Returns:
+            Matching node or None
+        """
+        if root_node.start_byte == start_byte and root_node.end_byte == end_byte:
+            return root_node
+
+        for child in root_node.children:
+            result = self._find_node_at_position(child, start_byte, end_byte)
+            if result:
+                return result
+
+        return None

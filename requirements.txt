@@ -5,6 +5,9 @@ fastmcp>=0.1.0
 # Vector Database
 qdrant-client>=1.7.0
 
+# Graph Database
+neo4j>=5.15.0
+
 # Embeddings
 ollama>=0.1.0
 httpx>=0.24.0

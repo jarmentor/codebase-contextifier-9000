@@ -19,6 +19,7 @@ from .tools.search_tool import SearchTool
 from .tools.symbol_tool import SymbolTool
 from .vector_db.qdrant_client import CodeVectorDB
 from .vector_db.knowledge_db import KnowledgeVectorDB
+from .graph_db.neo4j_client import CodeGraphDB
 
 # Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO")
@@ -51,6 +52,7 @@ mcp = FastMCP("codebase-contextifier-9000")
 # Global components (initialized on startup)
 vector_db: Optional[CodeVectorDB] = None
 knowledge_db: Optional[KnowledgeVectorDB] = None
+graph_db: Optional[CodeGraphDB] = None
 embeddings: Optional[OllamaEmbeddings] = None
 merkle_indexer: Optional[MerkleTreeIndexer] = None
 chunker: Optional[ASTChunker] = None
@@ -67,6 +69,10 @@ def get_env_config():
     return {
         "qdrant_host": os.getenv("QDRANT_HOST", "localhost"),
         "qdrant_port": int(os.getenv("QDRANT_PORT", "6333")),
+        "neo4j_uri": os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        "neo4j_user": os.getenv("NEO4J_USER", "neo4j"),
+        "neo4j_password": os.getenv("NEO4J_PASSWORD", "codebase123"),
+        "enable_graph_db": os.getenv("ENABLE_GRAPH_DB", "true").lower() == "true",
         "ollama_host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "nomic-embed-text"),
         "index_path": Path(os.getenv("INDEX_PATH", "/index")),
@@ -87,7 +93,7 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
         modified_files: Set of modified/created file paths
         deleted_files: Set of deleted file paths
     """
-    global vector_db, embeddings, merkle_indexer, chunker
+    global vector_db, embeddings, merkle_indexer, chunker, graph_db
 
     if not all([vector_db, embeddings, merkle_indexer, chunker]):
         logger.warning("Components not initialized, skipping file change handling")
@@ -99,12 +105,22 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
             f"{len(deleted_files)} deleted"
         )
 
+        # Derive repo_name from workspace path (file watcher watches single workspace)
+        workspace_path = Path(config["workspace_path"])
+        repo_name = workspace_path.name
+
         with IncrementalIndexingSession(merkle_indexer) as session:
             # Handle deleted files
             for file_path in deleted_files:
                 chunk_ids = session.remove_file(file_path)
                 if chunk_ids:
                     vector_db.delete_by_file_path(file_path)
+                    # Also remove from Neo4j
+                    if graph_db:
+                        try:
+                            graph_db.delete_by_file_path(file_path)
+                        except Exception as e:
+                            logger.warning(f"Failed to delete graph nodes for {file_path}: {e}")
                     logger.info(f"Removed chunks for deleted file: {file_path}")
 
             # Handle modified files
@@ -131,6 +147,7 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
                     chunk_dicts = [
                         {
                             "id": chunk.id,
+                            "repo_name": repo_name,
                             "file_path": chunk.file_path,
                             "start_line": chunk.start_line,
                             "end_line": chunk.end_line,
@@ -145,6 +162,56 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
 
                     # Upsert to vector DB
                     vector_db.upsert_chunks(chunk_dicts, chunk_embeddings)
+
+                    # Extract and update relationships in Neo4j
+                    if graph_db:
+                        try:
+                            # First, remove old nodes for this file
+                            graph_db.delete_by_file_path(file_path, repo_name=repo_name)
+
+                            # Extract relationships
+                            relationships = chunker.extract_relationships(file_path, chunks=chunks)
+
+                            # Import helper functions from indexer script
+                            from scripts.indexer import (
+                                chunk_to_graph_node,
+                                relationship_to_graph_relationship,
+                                create_external_placeholder_node,
+                            )
+
+                            # Convert chunks to graph nodes
+                            graph_nodes = [chunk_to_graph_node(chunk, repo_name) for chunk in chunks]
+
+                            # Create external placeholder nodes for unresolved relationships
+                            external_nodes = []
+                            for rel in relationships:
+                                if rel.target_id is None:
+                                    external_node = create_external_placeholder_node(
+                                        rel.target_name, rel.relationship_type
+                                    )
+                                    external_nodes.append(external_node)
+
+                            # Create all nodes (code + external)
+                            all_nodes = graph_nodes + external_nodes
+                            if all_nodes:
+                                graph_db.batch_create_nodes(all_nodes)
+
+                            # Convert ALL relationships (now all have targets)
+                            graph_relationships = [
+                                relationship_to_graph_relationship(rel)
+                                for rel in relationships
+                            ]
+
+                            if graph_relationships:
+                                graph_db.batch_create_relationships(graph_relationships)
+
+                            logger.debug(
+                                f"Updated graph for {file_path}: {len(graph_nodes)} nodes, "
+                                f"{len(external_nodes)} external nodes, {len(graph_relationships)} relationships"
+                            )
+
+                        except Exception as e:
+                            logger.warning(f"Failed to update graph for {file_path}: {e}")
 
                     # Update merkle tree
                     chunk_ids = [chunk.id for chunk in chunks]
@@ -167,7 +234,7 @@ async def handle_file_changes(modified_files: set, deleted_files: set) -> None:
 
 async def initialize_components():
     """Initialize all components on startup."""
-    global vector_db, knowledge_db, embeddings, merkle_indexer, chunker
+    global vector_db, knowledge_db, graph_db, embeddings, merkle_indexer, chunker
     global index_tool, search_tool, symbol_tool, knowledge_indexer, file_watcher, watcher_task
 
     config = get_env_config()
@@ -184,6 +251,28 @@ async def initialize_components():
             host=config["qdrant_host"],
             port=config["qdrant_port"],
         )
+
+        # Initialize graph database (Neo4j)
+        if config["enable_graph_db"]:
+            logger.info(f"Connecting to Neo4j at {config['neo4j_uri']}")
+            try:
+                graph_db = CodeGraphDB(
+                    uri=config["neo4j_uri"],
+                    user=config["neo4j_user"],
+                    password=config["neo4j_password"],
+                )
+                if graph_db.verify_connectivity():
+                    logger.info("Neo4j connection successful, creating indexes...")
+                    graph_db.create_indexes()
+                    logger.info("Neo4j initialized successfully")
+                else:
+                    logger.warning("Neo4j connectivity check failed")
+                    graph_db = None
+            except Exception as e:
+                logger.warning(f"Failed to initialize Neo4j: {e}. Graph features will be disabled.")
+                graph_db = None
+        else:
+            logger.info("Graph database disabled (set ENABLE_GRAPH_DB=true to enable)")
 
         # Initialize embeddings
         logger.info(f"Connecting to Ollama at {config['ollama_host']}")
@@ -446,12 +535,20 @@ def health_check() -> dict:
     health = {
         "server": True,
         "vector_db": False,
+        "knowledge_db": False,
+        "graph_db": False,
         "embeddings": False,
     }
 
     try:
         if vector_db:
             health["vector_db"] = vector_db.health_check()
+
+        if knowledge_db:
+            health["knowledge_db"] = knowledge_db.health_check()
+
+        if graph_db:
+            health["graph_db"] = graph_db.verify_connectivity()
 
         # Note: embeddings.health_check() is async, so we skip it here
         # It's checked during initialization
@@ -695,6 +792,247 @@ async def index_dependencies(
 
     except Exception as e:
         logger.error(f"Error indexing dependencies: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ============================================================================
+# Graph Database / Relationship Query Tools
+# ============================================================================
+
+
+@mcp.tool()
+async def get_call_graph(
+    function_id: str,
+    max_depth: int = 5,
+    repo_name: Optional[str] = None,
+) -> dict:
+    """Get the call graph for a function (what it calls, transitively).
+
+    Args:
+        function_id: ID of the function (chunk ID from Qdrant search)
+        max_depth: Maximum depth to traverse (default: 5)
+        repo_name: Optional repository filter
+
+    Returns:
+        Dictionary with call graph including nodes and relationships
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        result = graph_db.get_call_graph(
+            function_id=function_id,
+            max_depth=max_depth,
+            repo_name=repo_name,
+        )
+        return {
+            "success": True,
+            "function_id": function_id,
+            "max_depth": max_depth,
+            "call_graph": result,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting call graph: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def find_callers(
+    function_id: str,
+    max_depth: int = 10,
+) -> dict:
+    """Find all functions that call a given function.
+
+    Args:
+        function_id: ID of the function (chunk ID from Qdrant search)
+        max_depth: Maximum depth to traverse (default: 10)
+
+    Returns:
+        List of functions that call this function
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        callers = graph_db.find_callers(function_id=function_id, max_depth=max_depth)
+        return {
+            "success": True,
+            "function_id": function_id,
+            "callers": callers,
+            "count": len(callers),
+        }
+
+    except Exception as e:
+        logger.error(f"Error finding callers: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def find_callees(
+    function_id: str,
+    max_depth: int = 10,
+) -> dict:
+    """Find all functions that a given function calls.
+
+    Args:
+        function_id: ID of the function (chunk ID from Qdrant search)
+        max_depth: Maximum depth to traverse (default: 10)
+
+    Returns:
+        List of functions called by this function
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        callees = graph_db.find_callees(function_id=function_id, max_depth=max_depth)
+        return {
+            "success": True,
+            "function_id": function_id,
+            "callees": callees,
+            "count": len(callees),
+        }
+
+    except Exception as e:
+        logger.error(f"Error finding callees: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def find_usages(
+    entity_name: str,
+    entity_type: Optional[str] = None,
+    repo_name: Optional[str] = None,
+) -> dict:
+    """Find all usages of a code entity (function, class, etc.).
+
+    Args:
+        entity_name: Name of the entity to search for
+        entity_type: Type of entity (Function, Class, Method, etc.)
+        repo_name: Optional repository filter
+
+    Returns:
+        List of all places where this entity is used
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        usages = graph_db.find_usages(
+            entity_name=entity_name,
+            entity_type=entity_type,
+            repo_name=repo_name,
+        )
+        return {
+            "success": True,
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "usages": usages,
+            "count": len(usages),
+        }
+
+    except Exception as e:
+        logger.error(f"Error finding usages: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def get_class_hierarchy(
+    class_name: str,
+    repo_name: Optional[str] = None,
+    direction: str = "both",
+) -> dict:
+    """Get the inheritance hierarchy for a class.
+
+    Args:
+        class_name: Name of the class
+        repo_name: Optional repository filter
+        direction: Direction to traverse ("up" for parents, "down" for children, "both")
+
+    Returns:
+        Dictionary with class hierarchy including parents and children
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        hierarchy = graph_db.get_class_hierarchy(
+            class_name=class_name,
+            repo_name=repo_name,
+            direction=direction,
+        )
+        return {
+            "success": True,
+            "class_name": class_name,
+            "direction": direction,
+            "hierarchy": hierarchy,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting class hierarchy: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def detect_circular_dependencies(
+    repo_name: Optional[str] = None,
+) -> dict:
+    """Detect circular import dependencies in the codebase.
+
+    Args:
+        repo_name: Optional repository filter (detects across all repos if not specified)
+
+    Returns:
+        List of circular dependency cycles
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        cycles = graph_db.detect_circular_dependencies(repo_name=repo_name)
+        return {
+            "success": True,
+            "repo_name": repo_name,
+            "cycles": cycles,
+            "count": len(cycles),
+        }
+
+    except Exception as e:
+        logger.error(f"Error detecting circular dependencies: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def get_graph_statistics(
+    repo_name: Optional[str] = None,
+) -> dict:
+    """Get statistics about the code relationship graph.
+
+    Args:
+        repo_name: Optional repository filter
+
+    Returns:
+        Dictionary with node counts, relationship counts, etc.
+    """
+    if not graph_db:
+        return {"success": False, "error": "Graph database not enabled"}
+
+    try:
+        stats = graph_db.get_statistics()
+
+        # Filter by repo if specified
+        if repo_name:
+            # TODO: Could enhance get_statistics to support repo filtering
+            stats["note"] = f"Statistics shown are global (repo filter not yet implemented)"
+
+        return {
+            "success": True,
+            "statistics": stats,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting graph statistics: {e}")
         return {"success": False, "error": str(e)}
 
 
