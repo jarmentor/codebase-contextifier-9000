@@ -220,7 +220,7 @@ async def initialize_components():
                     debounce_seconds=config["watcher_debounce"],
                     recursive=True,
                 )
-                logger.info("File watcher initialized (will start after server ready)")
+                logger.info("File watcher initialized successfully")
             else:
                 logger.warning(
                     f"Workspace path does not exist: {workspace_path}. "
@@ -234,6 +234,47 @@ async def initialize_components():
     except Exception as e:
         logger.error(f"Error during initialization: {e}")
         raise
+
+
+def start_file_watcher_sync():
+    """Start the file watcher synchronously (observer thread)."""
+    global file_watcher
+
+    if file_watcher is not None:
+        logger.info("Starting file watcher observer thread...")
+        file_watcher.start()
+        logger.info("File watcher observer is now running and monitoring for changes")
+    else:
+        logger.debug("File watcher not initialized, skipping startup")
+
+
+async def start_file_watcher_async_task():
+    """Start the async debounce processor for the file watcher."""
+    global file_watcher, watcher_task
+
+    if file_watcher is not None and file_watcher.is_running():
+        logger.info("Starting file watcher debounce processor...")
+        watcher_task = asyncio.create_task(file_watcher.start_debounce_processor())
+        logger.info("File watcher debounce processor running")
+    else:
+        logger.debug("File watcher observer not running, skipping debounce processor")
+
+
+def stop_file_watcher_sync():
+    """Stop the file watcher synchronously."""
+    global file_watcher, watcher_task
+
+    if file_watcher is not None:
+        logger.info("Stopping file watcher observer...")
+        file_watcher.stop()
+        logger.info("File watcher observer stopped")
+
+        # Cancel the async task if it exists
+        if watcher_task is not None and not watcher_task.done():
+            logger.info("Cancelling file watcher debounce processor...")
+            watcher_task.cancel()
+    else:
+        logger.debug("File watcher not running, skipping shutdown")
 
 
 
@@ -345,20 +386,42 @@ def get_watcher_status() -> dict:
         Dictionary with watcher status
     """
     if file_watcher is None:
+        config = get_env_config()
         return {
             "success": True,
             "enabled": False,
             "running": False,
-            "message": "File watcher not initialized (set ENABLE_FILE_WATCHER=true)",
+            "watcher_enabled_in_config": config["enable_watcher"],
+            "workspace_path": config["workspace_path"],
+            "message": "File watcher not initialized (check ENABLE_FILE_WATCHER and workspace path)",
         }
 
-    return {
+    is_running = file_watcher.is_running()
+    has_task = watcher_task is not None and not watcher_task.done()
+
+    status = {
         "success": True,
         "enabled": True,
-        "running": file_watcher.is_running(),
+        "running": is_running,
+        "task_active": has_task,
         "watch_path": str(file_watcher.watch_path),
         "debounce_seconds": file_watcher.debounce_seconds,
+        "recursive": file_watcher.recursive,
     }
+
+    # Add pending changes info if available
+    if hasattr(file_watcher, "event_handler"):
+        status["pending_changes"] = {
+            "modified_files": len(file_watcher.event_handler.modified_files),
+            "deleted_files": len(file_watcher.event_handler.deleted_files),
+            "time_since_last_change": (
+                file_watcher.event_handler.time_since_last_change()
+                if file_watcher.event_handler.last_change_time > 0
+                else None
+            ),
+        }
+
+    return status
 
 
 @mcp.tool()
@@ -510,13 +573,53 @@ async def index_repository(
     )
 
 
+def run_watcher_debounce_in_thread():
+    """Run the file watcher's async debounce processor in a separate thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        if file_watcher is not None and file_watcher.is_running():
+            logger.info("Starting file watcher debounce processor in background thread...")
+            loop.run_until_complete(file_watcher.start_debounce_processor())
+    except Exception as e:
+        logger.error(f"File watcher debounce processor error: {e}")
+    finally:
+        loop.close()
+
+
 if __name__ == "__main__":
-    # Run the server
+    import threading
+    import atexit
+
     logger.info("Starting Codebase Contextifier 9000 MCP Server...")
 
-    # Initialize components before starting server
-    import asyncio
+    # Initialize components (runs in temporary event loop)
     asyncio.run(initialize_components())
 
-    # Note: File watcher will be started by FastMCP's event loop if enabled
-    mcp.run()
+    # Start file watcher observer (runs in watchdog thread)
+    start_file_watcher_sync()
+
+    # Start debounce processor in separate thread
+    if file_watcher is not None:
+        watcher_thread = threading.Thread(
+            target=run_watcher_debounce_in_thread,
+            daemon=True,
+            name="FileWatcherDebounce"
+        )
+        watcher_thread.start()
+        logger.info("File watcher fully initialized and running")
+
+    # Register cleanup handler
+    atexit.register(stop_file_watcher_sync)
+
+    logger.info("Server ready!")
+
+    # Run the MCP server (blocks until shutdown)
+    try:
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("Server interrupted")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        raise

@@ -39,8 +39,9 @@ class OllamaEmbeddings:
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.batch_size = batch_size
         self.max_concurrent = max_concurrent
-        self.client = httpx.AsyncClient(timeout=60.0)
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop_id: Optional[int] = None
+        self._semaphore = None
 
         # Create cache directory if specified
         if self.cache_dir:
@@ -48,6 +49,41 @@ class OllamaEmbeddings:
             logger.info(f"Embedding cache enabled at: {self.cache_dir}")
 
         logger.info(f"Initialized Ollama embeddings with model: {model}")
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Get or create an httpx client for the current event loop.
+
+        Returns:
+            httpx.AsyncClient instance for current event loop
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop_id = id(loop)
+
+            # Create new client if we don't have one or if we're in a different event loop
+            if self._client is None or self._client_loop_id != loop_id:
+                # Clean up old client if it exists
+                if self._client is not None:
+                    try:
+                        # Don't await since it might be from a different loop
+                        pass
+                    except Exception:
+                        pass
+
+                self._client = httpx.AsyncClient(timeout=60.0)
+                self._client_loop_id = loop_id
+                logger.debug(f"Created new httpx client for event loop {loop_id}")
+
+            # Recreate semaphore if needed
+            if self._semaphore is None:
+                self._semaphore = asyncio.Semaphore(self.max_concurrent)
+
+            return self._client
+        except RuntimeError:
+            # No running event loop, create a basic client
+            if self._client is None:
+                self._client = httpx.AsyncClient(timeout=60.0)
+            return self._client
 
     def _get_cache_key(self, text: str) -> str:
         """Generate cache key for a text.
@@ -119,9 +155,12 @@ class OllamaEmbeddings:
         Raises:
             httpx.HTTPError: If API request fails
         """
-        async with self._semaphore:
+        client = self._get_client()
+        semaphore = self._semaphore or asyncio.Semaphore(self.max_concurrent)
+
+        async with semaphore:
             try:
-                response = await self.client.post(
+                response = await client.post(
                     f"{self.host}/api/embeddings",
                     json={"model": self.model, "prompt": text},
                 )
@@ -217,8 +256,10 @@ class OllamaEmbeddings:
             True if healthy, False otherwise
         """
         try:
+            client = self._get_client()
+
             # Check if Ollama is running
-            response = await self.client.get(f"{self.host}/api/tags")
+            response = await client.get(f"{self.host}/api/tags")
             response.raise_for_status()
 
             # Check if our model is available
@@ -265,7 +306,11 @@ class OllamaEmbeddings:
 
     async def close(self) -> None:
         """Close the HTTP client."""
-        await self.client.aclose()
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception as e:
+                logger.warning(f"Error closing httpx client: {e}")
 
     async def __aenter__(self):
         """Async context manager entry."""
