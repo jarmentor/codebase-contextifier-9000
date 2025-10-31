@@ -194,7 +194,7 @@ Key environment variables (set in `.env` or `docker-compose.yml`):
 - `CODEBASE_PATH` - Path to codebase to mount (Docker host path)
 - `WORKSPACE_PATH` - Path inside container where codebase is mounted (default: `/workspace`)
 - `OLLAMA_HOST` - Ollama API endpoint (default: `http://host.docker.internal:11434`)
-- `EMBEDDING_MODEL` - Ollama model name (default: `nomic-embed-text`)
+- `EMBEDDING_MODEL` - Ollama model name (default: `embeddinggemma:latest`)
 - `QDRANT_HOST` / `QDRANT_PORT` - Qdrant connection settings
 - `INDEX_PATH` - Directory for merkle tree state (default: `/index`)
 - `CACHE_PATH` - Directory for embedding cache (default: `/cache`)
@@ -360,7 +360,7 @@ docker exec -it codebase-qdrant wget -qO- http://localhost:6333/collections
 ### Testing Search Quality
 
 Search quality depends on:
-- **Embedding model**: `nomic-embed-text` (balanced), `mxbai-embed-large` (better accuracy)
+- **Embedding model**: `embeddinggemma:latest` (recommended), `mxbai-embed-large` (higher accuracy), `nomic-embed-text` (faster)
 - **Chunk size**: Smaller chunks = more precise but need more context
 - **Query phrasing**: Natural language works better than keywords
 - **Multi-repo search**: Filter by `repo_name` parameter if searching specific project

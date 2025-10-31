@@ -77,7 +77,7 @@ services:
       - NEO4J_PASSWORD=codebase123
       - ENABLE_GRAPH_DB=${ENABLE_GRAPH_DB:-true}
       - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embeddinggemma:latest}
       - INDEX_PATH=/index
       - CACHE_PATH=/cache
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

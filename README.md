@@ -1,6 +1,6 @@
 # Codebase Contextifier 9000
 
-A Docker-based Model Context Protocol (MCP) server for semantic code search with AST-aware chunking, local LLM support, and incremental indexing.
+A Docker-based Model Context Protocol (MCP) server for semantic code search with AST-aware chunking, relationship tracking via Neo4j graph database, local LLM support, and incremental indexing.
 
 ## Documentation
 
@@ -11,9 +11,44 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 - 🔬 **[Research & Methodology](docs/AST_codeChunking.md)** - Deep dive into semantic code search
 - 📖 **[Full Documentation](docs/)** - Complete docs directory
 
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+  - [Key Architectural Features](#key-architectural-features)
+- [Quick Start](#quick-start)
+  - [Prerequisites](#prerequisites)
+  - [Two Deployment Options](#two-deployment-options)
+  - [Claude Desktop Configuration](#claude-desktop-configuration)
+  - [Usage](#usage)
+- [MCP Tools](#mcp-tools)
+  - [Indexing Tools](#indexing-tools): `index_repository`, `get_job_status`, `list_indexing_jobs`, `cancel_indexing_job`
+  - [Search Tools](#search-tools): `search_code`, `get_symbols`
+  - [Graph Query Tools](#graph-query-tools): `find_usages`, `find_dependencies`, `query_graph`
+  - [Dependency Tools](#dependency-tools): `detect_dependencies`, `index_dependencies`, `list_indexed_dependencies`
+  - [Status Tools](#status-tools): `get_indexing_status`, `clear_index`, `get_watcher_status`, `health_check`
+- [Supported Languages](#supported-languages)
+- [Configuration](#configuration)
+  - [Environment Variables](#environment-variables)
+  - [Recommended Embedding Models](#recommended-embedding-models)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [Architecture Details](#architecture-details)
+  - [AST-Aware Chunking](#ast-aware-chunking)
+  - [Incremental Indexing](#incremental-indexing)
+  - [Content-Addressable Storage](#content-addressable-storage)
+- [Roadmap](#roadmap)
+- [Research & References](#research--references)
+- [License](#license)
+- [Contributing](#contributing)
+- [Support](#support)
+
 ## Features
 
 - **AST-Aware Chunking**: Uses tree-sitter to respect function and class boundaries, maintaining semantic integrity
+- **Relationship Tracking**: Neo4j graph database tracks function calls, imports, inheritance, and dependencies across your codebase
+- **External Dependency Mapping**: Automatically creates placeholder nodes for external functions (WordPress, npm packages, etc.)
 - **Job-Based Indexing**: Background indexing with progress tracking for large codebases
 - **On-Demand Container Spawning**: Index any repository on your system without manual mounting
 - **Multi-Repository Search**: Index and search across multiple projects with a shared backend
@@ -21,7 +56,8 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 - **Local-First**: All processing happens locally using Ollama for embeddings (no data leaves your machine)
 - **Polyglot Support**: Supports 10+ programming languages including TypeScript, Python, PHP, Go, Rust, Java, C++, and more
 - **Incremental Indexing**: Merkle tree-based change detection with 80%+ cache hit rates
-- **Production-Grade**: Uses Qdrant vector database for sub-10ms search latency
+- **Production-Grade**: Uses Qdrant vector database for sub-10ms search latency and Neo4j for relationship queries
+- **Dependency Knowledge Base**: Special collection for indexing WordPress plugins, Composer packages, and npm modules
 - **Flexible Deployment**: Per-project or centralized server deployment options
 - **MCP Integration**: Works with Claude Desktop, Cursor, VS Code, and other MCP-compatible tools
 
@@ -39,6 +75,8 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 │  │  FastMCP Server - Exposes MCP Tools:                      │  │
 │  │  • index_repository (spawns indexer containers)           │  │
 │  │  • search_code (semantic search across all repos)         │  │
+│  │  • find_usages, find_dependencies (graph queries)         │  │
+│  │  • detect_dependencies, index_dependencies                │  │
 │  │  • get_job_status, list_indexing_jobs, cancel_job        │  │
 │  │  • get_symbols, get_indexing_status, health_check        │  │
 │  └──────────────┬───────────────────────────────────────────┘  │
@@ -49,34 +87,45 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 │  │  On-Demand Indexer Containers (ephemeral)           │       │
 │  │  • Mounts any host directory                        │       │
 │  │  • AST-aware chunking with tree-sitter              │       │
+│  │  • Extracts relationships (CALLS, IMPORTS, etc.)    │       │
 │  │  • Generates embeddings via Ollama                  │       │
-│  │  • Updates shared Qdrant database                   │       │
+│  │  • Updates shared Qdrant & Neo4j databases          │       │
 │  │  • Reports progress back to MCP server              │       │
 │  └──────────────────────┬──────────────────────────────┘       │
 └─────────────────────────┼──────────────────────────────────────┘
                           │
-          ┌───────────────┴───────────────┐
-          │                               │
-   ┌──────▼──────┐              ┌────────▼─────────┐
-   │   Qdrant    │              │  Ollama (Host)   │
-   │  Container  │              │  Embedding Model │
-   └──────┬──────┘              └──────────────────┘
-          │
-   ┌──────▼────────────────────────────┐
-   │  Persistent Docker Volumes:       │
-   │  • qdrant_data (vector DB)        │
-   │  • index_data (merkle trees)      │
-   │  • cache_data (embeddings cache)  │
-   └───────────────────────────────────┘
+          ┌───────────────┴───────────────────┐
+          │                                   │
+   ┌──────▼──────┐              ┌────────────▼────────┐
+   │   Qdrant    │              │      Neo4j          │
+   │  Container  │              │    Container        │
+   │  (Vectors)  │              │  (Relationships)    │
+   └──────┬──────┘              └──────┬──────────────┘
+          │                            │
+   ┌──────▼────────────────────────────▼───────────┐
+   │  Persistent Docker Volumes:                   │
+   │  • qdrant_data (vector DB)                    │
+   │  • neo4j_data (graph DB)                      │
+   │  • index_data (merkle trees)                  │
+   │  • cache_data (embeddings cache)              │
+   └───────────────────────────────────────────────┘
+
+   ┌────────────────────────┐
+   │  Ollama (Host)         │
+   │  Embedding Model       │
+   └────────────────────────┘
 ```
 
 ### Key Architectural Features
 
+- **Dual Database Architecture**: Qdrant for semantic vector search, Neo4j for relationship graph queries
 - **Container Orchestration**: MCP server spawns lightweight indexer containers on-demand via Docker socket
-- **Multi-Repository Support**: Each repository gets its own merkle tree state, but shares the vector database
-- **Shared Backend**: All projects use the same Qdrant instance, enabling cross-repository search
+- **Multi-Repository Support**: Each repository gets its own merkle tree state, but shares the vector & graph databases
+- **Shared Backend**: All projects use the same Qdrant & Neo4j instances, enabling cross-repository search and relationship tracking
 - **Job-Based Processing**: Background jobs with progress tracking for large codebases
 - **Content-Addressable Caching**: Embeddings are cached by content hash, shared across all repositories
+- **Relationship Extraction**: AST-based extraction of CALLS, IMPORTS, EXTENDS, and IMPLEMENTS relationships
+- **External Dependency Tracking**: Automatic creation of placeholder nodes for unresolved function calls
 
 ## Quick Start
 
@@ -88,6 +137,11 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 2. **Ollama** running locally with an embedding model:
    ```bash
    # Install Ollama: https://ollama.ai
+
+   # Recommended: Google's Gemma embedding model (best quality)
+   ollama pull embeddinggemma:latest
+
+   # Alternative: Nomic Embed (faster, smaller)
    ollama pull nomic-embed-text
    ```
 
@@ -186,6 +240,22 @@ Claude, search for "error handling" filtering by language=python and repo_name=m
 Claude, get all functions from /workspace/src/utils.py
 ```
 
+**Find all usages of a function (graph query):**
+```
+Claude, find all places where authenticate_user is called
+```
+
+**Find dependencies of a function (graph query):**
+```
+Claude, show me all functions that processPayment depends on
+```
+
+**Detect and index external dependencies:**
+```
+Claude, detect available WordPress plugins in this project
+Claude, index the woocommerce plugin into the knowledge base
+```
+
 **Check system status:**
 ```
 Claude, show me the indexing status and list all jobs
@@ -193,7 +263,9 @@ Claude, show me the indexing status and list all jobs
 
 ## MCP Tools
 
-### `index_repository`
+### Indexing Tools
+
+#### `index_repository`
 
 Index a repository from any directory on your host machine by spawning a lightweight indexer container.
 
@@ -224,7 +296,7 @@ await index_repository(
 )
 ```
 
-### `get_job_status`
+#### `get_job_status`
 
 Get the status and progress of an indexing job.
 
@@ -256,7 +328,7 @@ Get the status and progress of an indexing job.
 
 **Status values:** `"queued"`, `"running"`, `"completed"`, `"failed"`, `"cancelled"`
 
-### `list_indexing_jobs`
+#### `list_indexing_jobs`
 
 List all indexing jobs (past and present).
 
@@ -282,7 +354,7 @@ List all indexing jobs (past and present).
 }
 ```
 
-### `cancel_indexing_job`
+#### `cancel_indexing_job`
 
 Cancel a running indexing job.
 
@@ -297,7 +369,9 @@ Cancel a running indexing job.
 }
 ```
 
-### `search_code`
+### Search Tools
+
+#### `search_code`
 
 Search code using natural language queries with semantic understanding across all indexed repositories.
 
@@ -331,7 +405,7 @@ Search code using natural language queries with semantic understanding across al
 }
 ```
 
-### `get_symbols`
+#### `get_symbols`
 
 Extract symbols from a file using AST parsing.
 
@@ -358,18 +432,175 @@ Extract symbols from a file using AST parsing.
 }
 ```
 
-### `get_indexing_status`
+### Graph Query Tools
 
-Get statistics about the index.
+#### `find_usages`
+
+Find all places where a function, class, or symbol is used across the codebase using the graph database.
+
+**Parameters:**
+- `symbol_name` (string, required): Name of the function/class to find usages for
+- `repo_name` (string, optional): Filter by repository name
 
 **Returns:**
 ```json
 {
   "success": true,
-  "vector_db": {
+  "symbol_name": "authenticate_user",
+  "total_usages": 12,
+  "usages": [
+    {
+      "caller": "LoginController.handleLogin",
+      "caller_file": "/workspace/src/controllers/login.ts",
+      "line_number": 42,
+      "relationship_type": "CALLS"
+    }
+  ]
+}
+```
+
+#### `find_dependencies`
+
+Find all functions, classes, or imports that a symbol depends on using the graph database.
+
+**Parameters:**
+- `symbol_name` (string, required): Name of the function/class to analyze
+- `repo_name` (string, optional): Filter by repository name
+
+**Returns:**
+```json
+{
+  "success": true,
+  "symbol_name": "processPayment",
+  "total_dependencies": 8,
+  "dependencies": [
+    {
+      "target": "validateCard",
+      "target_file": "/workspace/src/utils/validation.ts",
+      "relationship_type": "CALLS",
+      "is_external": false
+    },
+    {
+      "target": "stripe.charges.create",
+      "relationship_type": "CALLS",
+      "is_external": true
+    }
+  ]
+}
+```
+
+#### `query_graph`
+
+Execute custom Cypher queries against the Neo4j graph database for advanced relationship analysis.
+
+**Parameters:**
+- `cypher_query` (string, required): Cypher query to execute
+- `limit` (int, optional): Maximum number of results (default: 100)
+
+**Returns:**
+```json
+{
+  "success": true,
+  "query": "MATCH (f:Function)-[:CALLS]->(ext:ExternalFunction) WHERE ext.name =~ 'wp_.*' RETURN f.name, ext.name",
+  "results": [
+    {"f.name": "enqueue_scripts", "ext.name": "wp_enqueue_script"},
+    {"f.name": "setup_theme", "ext.name": "wp_register_nav_menu"}
+  ],
+  "total_results": 2
+}
+```
+
+### Dependency Tools
+
+#### `detect_dependencies`
+
+Detect available dependencies in the workspace (WordPress plugins/themes, Composer packages, npm modules).
+
+**Parameters:**
+- `workspace_path` (string, optional): Path to workspace (defaults to current workspace)
+
+**Returns:**
+```json
+{
+  "success": true,
+  "dependencies": {
+    "wordpress_plugins": ["woocommerce", "advanced-custom-fields"],
+    "wordpress_themes": ["twentytwentyfour"],
+    "composer_packages": ["symfony/console", "guzzlehttp/guzzle"],
+    "npm_packages": ["react", "typescript"]
+  },
+  "total_dependencies": 6
+}
+```
+
+#### `index_dependencies`
+
+Index specific dependencies into the knowledge base for better understanding of external APIs.
+
+**Parameters:**
+- `dependency_names` (array, required): List of dependency names to index (e.g., `["woocommerce", "react"]`)
+- `workspace_id` (string, required): Unique identifier for the workspace/project
+- `workspace_path` (string, optional): Path to workspace
+
+**Returns:**
+```json
+{
+  "success": true,
+  "indexed_dependencies": ["woocommerce"],
+  "total_chunks": 1247,
+  "message": "Successfully indexed 1 dependencies with 1247 chunks"
+}
+```
+
+#### `list_indexed_dependencies`
+
+List all dependencies that have been indexed in the knowledge base.
+
+**Returns:**
+```json
+{
+  "success": true,
+  "dependencies": [
+    {
+      "name": "woocommerce",
+      "version": "8.5.0",
+      "type": "wordpress_plugin",
+      "workspaces": ["my-store", "test-site"],
+      "chunks_count": 1247,
+      "indexed_at": "2024-01-15T10:30:00Z"
+    }
+  ],
+  "total_dependencies": 1
+}
+```
+
+### Status Tools
+
+#### `get_indexing_status`
+
+Get statistics about the index, including vector DB, graph DB, and cache metrics.
+
+**Returns:**
+```json
+{
+  "success": true,
+  "code_db": {
     "total_chunks": 2450,
     "vectors_count": 2450,
     "status": "green"
+  },
+  "knowledge_db": {
+    "total_chunks": 1247,
+    "indexed_dependencies": ["woocommerce"]
+  },
+  "graph_db": {
+    "enabled": true,
+    "total_nodes": 2230,
+    "total_relationships": 4407,
+    "node_types": {
+      "Function": 1459,
+      "ExternalFunction": 771
+    }
   },
   "index": {
     "indexed_files": 150,
@@ -383,11 +614,11 @@ Get statistics about the index.
 }
 ```
 
-### `clear_index`
+#### `clear_index`
 
 Clear the entire index (useful for fresh start).
 
-### `get_watcher_status`
+#### `get_watcher_status`
 
 Get status of the real-time file watcher.
 
@@ -402,9 +633,9 @@ Get status of the real-time file watcher.
 }
 ```
 
-### `health_check`
+#### `health_check`
 
-Check health status of all components.
+Check health status of all components (Ollama, Qdrant, Neo4j).
 
 ## Supported Languages
 
@@ -429,9 +660,13 @@ Check health status of all components.
 |----------------------------|----------------------------------|---------------------------------------|
 | `CODEBASE_PATH`            | `./sample_codebase`              | Path to codebase to index             |
 | `OLLAMA_HOST`              | `http://host.docker.internal:11434` | Ollama API endpoint                |
-| `EMBEDDING_MODEL`          | `nomic-embed-text`               | Ollama embedding model to use         |
+| `EMBEDDING_MODEL`          | `embeddinggemma:latest`          | Ollama embedding model to use         |
 | `QDRANT_HOST`              | `qdrant`                         | Qdrant server hostname                |
 | `QDRANT_PORT`              | `6333`                           | Qdrant server port                    |
+| `ENABLE_GRAPH_DB`          | `false`                          | Enable Neo4j graph database           |
+| `NEO4J_URI`                | `bolt://neo4j:7687`              | Neo4j connection URI                  |
+| `NEO4J_USER`               | `neo4j`                          | Neo4j username                        |
+| `NEO4J_PASSWORD`           | `password`                       | Neo4j password                        |
 | `INDEX_PATH`               | `/index`                         | Path for index metadata               |
 | `CACHE_PATH`               | `/cache`                         | Path for embedding cache              |
 | `WORKSPACE_PATH`           | `/workspace`                     | Path to mounted codebase              |
@@ -444,11 +679,10 @@ Check health status of all components.
 
 ### Recommended Embedding Models
 
-| Model                 | Size | Dimensions | Best For                        |
-|-----------------------|------|------------|---------------------------------|
-| `nomic-embed-text`    | 137M | 768        | General-purpose (recommended)   |
-| `mxbai-embed-large`   | 335M | 1024       | Higher accuracy                 |
-| `all-minilm`          | 23M  | 384        | Fastest, lower accuracy         |
+- `embeddinggemma:latest` (recommended - best quality)
+- `nomic-embed-text` (good balance of speed and quality)
+- `mxbai-embed-large` (higher accuracy, slower)
+- `all-minilm` (fastest, lower accuracy)
 
 ## Performance
 
@@ -470,7 +704,7 @@ Check health status of all components.
 ### "Ollama health check failed"
 
 1. Make sure Ollama is running: `ollama serve`
-2. Pull the embedding model: `ollama pull nomic-embed-text`
+2. Pull the embedding model: `ollama pull embeddinggemma:latest`
 3. Check Docker can access host: Test with `curl http://host.docker.internal:11434`
 
 ### "Qdrant connection failed"
@@ -478,6 +712,14 @@ Check health status of all components.
 1. Check Qdrant container is running: `docker-compose ps`
 2. Check Qdrant logs: `docker-compose logs qdrant`
 3. Restart services: `docker-compose restart`
+
+### "Graph database not enabled"
+
+1. Set `ENABLE_GRAPH_DB=true` in your `.env` file or `.mcp.json`
+2. Ensure Neo4j environment variables are configured: `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`
+3. Check Neo4j container is running: `docker-compose ps`
+4. Check Neo4j logs: `docker-compose logs neo4j`
+5. Test Neo4j connection: `docker exec codebase-neo4j cypher-shell -u neo4j -p codebase123 "RETURN 1"`
 
 ### "No supported files found"
 
@@ -570,11 +812,13 @@ This enables:
 - [x] Multi-repo search with shared backend
 - [x] Job-based background indexing with progress tracking
 - [x] On-demand container spawning for flexible repository indexing
-- [ ] **Neo4j integration for relationship tracking** (In Progress) - Track function calls, imports, inheritance
+- [x] **Neo4j integration for relationship tracking** - Track function calls, imports, inheritance, with external dependency placeholders
+- [x] **Dependency knowledge base** - Index WordPress plugins, Composer packages, npm modules
 - [ ] Reranking with cross-encoders for improved accuracy
 - [ ] Fine-tuned embeddings for domain-specific code
 - [ ] HTTP transport for remote MCP servers
 - [ ] Web UI for search and visualization
+- [ ] Graph-based code navigation UI (Neo4j Browser or custom visualization)
 
 ## Research & References
 
