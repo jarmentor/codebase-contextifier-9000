@@ -4,7 +4,9 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 
 ## Documentation
 
-- 📚 **[Quick Start Guide](docs/QUICKSTART.md)** - Get running in 5 minutes
+- 📚 **[Quick Start Guide](QUICK_START.md)** - Get running in 5 minutes
+- 🔧 **[Multi-Project Setup](MULTI_PROJECT_SETUP.md)** - Index multiple projects with shared backend
+- ⚙️ **[Background Jobs](BACKGROUND_JOBS.md)** - Job-based indexing for large codebases
 - 👁️ **[File Watcher Guide](docs/FILE_WATCHER.md)** - Real-time monitoring and auto-indexing
 - 🔬 **[Research & Methodology](docs/AST_codeChunking.md)** - Deep dive into semantic code search
 - 📖 **[Full Documentation](docs/)** - Complete docs directory
@@ -12,57 +14,73 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
 ## Features
 
 - **AST-Aware Chunking**: Uses tree-sitter to respect function and class boundaries, maintaining semantic integrity
-- **Real-Time Updates**: File system watcher automatically re-indexes changed files (enabled by default)
+- **Job-Based Indexing**: Background indexing with progress tracking for large codebases
+- **On-Demand Container Spawning**: Index any repository on your system without manual mounting
+- **Multi-Repository Search**: Index and search across multiple projects with a shared backend
+- **Real-Time Updates**: File system watcher automatically re-indexes changed files (optional)
 - **Local-First**: All processing happens locally using Ollama for embeddings (no data leaves your machine)
 - **Polyglot Support**: Supports 10+ programming languages including TypeScript, Python, PHP, Go, Rust, Java, C++, and more
 - **Incremental Indexing**: Merkle tree-based change detection with 80%+ cache hit rates
 - **Production-Grade**: Uses Qdrant vector database for sub-10ms search latency
-- **Per-Codebase Deployment**: Spin up a dedicated container for each repository you work with
+- **Flexible Deployment**: Per-project or centralized server deployment options
 - **MCP Integration**: Works with Claude Desktop, Cursor, VS Code, and other MCP-compatible tools
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│  MCP Client     │  (Claude Desktop, Cursor, etc.)
-│  (Code Editor)  │
-└────────┬────────┘
-         │ MCP Protocol (stdio)
-         │
-┌────────▼────────────────────────────────────────────┐
-│  Docker Container                                    │
-│  ┌──────────────────────────────────────────────┐  │
-│  │  FastMCP Server                               │  │
-│  │  - index_repository                           │  │
-│  │  - search_code                                │  │
-│  │  - get_symbols                                │  │
-│  │  - get_indexing_status                        │  │
-│  └──────┬───────────────────────────────────────┘  │
-│         │                                            │
-│  ┌──────▼──────────┐  ┌─────────────────────────┐  │
-│  │ Tree-sitter     │  │ Merkle Tree Indexer     │  │
-│  │ AST Chunker     │  │ (Incremental Updates)   │  │
-│  └──────┬──────────┘  └─────────┬───────────────┘  │
-│         │                        │                   │
-│  ┌──────▼────────────────────────▼───────────────┐  │
-│  │  Ollama Embeddings (Local)                    │  │
-│  │  - nomic-embed-text / mxbai-embed-large       │  │
-│  │  - Content-addressable cache                  │  │
-│  └───────────────────┬───────────────────────────┘  │
-│                      │                               │
-│  ┌──────────────────▼─────────────────────────────┐ │
-│  │  Qdrant Vector Database                        │ │
-│  │  - Semantic search with metadata filtering     │ │
-│  └────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────┘
-         │                      │
-   ┌─────▼─────┐          ┌────▼─────┐
-   │  Volumes  │          │  Volumes │
-   │  /index   │          │  /cache  │
-   └───────────┘          └──────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  MCP Client (Claude Code, Claude Desktop, Cursor, etc.)         │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ MCP Protocol (stdio)
+                               │
+┌──────────────────────────────▼──────────────────────────────────┐
+│  MCP Server Container (codebase-mcp-server)                     │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  FastMCP Server - Exposes MCP Tools:                      │  │
+│  │  • index_repository (spawns indexer containers)           │  │
+│  │  • search_code (semantic search across all repos)         │  │
+│  │  • get_job_status, list_indexing_jobs, cancel_job        │  │
+│  │  • get_symbols, get_indexing_status, health_check        │  │
+│  └──────────────┬───────────────────────────────────────────┘  │
+│                 │                                                │
+│                 │ Spawns via Docker Socket                       │
+│                 ▼                                                │
+│  ┌─────────────────────────────────────────────────────┐       │
+│  │  On-Demand Indexer Containers (ephemeral)           │       │
+│  │  • Mounts any host directory                        │       │
+│  │  • AST-aware chunking with tree-sitter              │       │
+│  │  • Generates embeddings via Ollama                  │       │
+│  │  • Updates shared Qdrant database                   │       │
+│  │  • Reports progress back to MCP server              │       │
+│  └──────────────────────┬──────────────────────────────┘       │
+└─────────────────────────┼──────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          │                               │
+   ┌──────▼──────┐              ┌────────▼─────────┐
+   │   Qdrant    │              │  Ollama (Host)   │
+   │  Container  │              │  Embedding Model │
+   └──────┬──────┘              └──────────────────┘
+          │
+   ┌──────▼────────────────────────────┐
+   │  Persistent Docker Volumes:       │
+   │  • qdrant_data (vector DB)        │
+   │  • index_data (merkle trees)      │
+   │  • cache_data (embeddings cache)  │
+   └───────────────────────────────────┘
 ```
 
+### Key Architectural Features
+
+- **Container Orchestration**: MCP server spawns lightweight indexer containers on-demand via Docker socket
+- **Multi-Repository Support**: Each repository gets its own merkle tree state, but shares the vector database
+- **Shared Backend**: All projects use the same Qdrant instance, enabling cross-repository search
+- **Job-Based Processing**: Background jobs with progress tracking for large codebases
+- **Content-Addressable Caching**: Embeddings are cached by content hash, shared across all repositories
+
 ## Quick Start
+
+**See [QUICK_START.md](QUICK_START.md) for detailed setup instructions.**
 
 ### Prerequisites
 
@@ -73,28 +91,45 @@ A Docker-based Model Context Protocol (MCP) server for semantic code search with
    ollama pull nomic-embed-text
    ```
 
-### Setup
+### Two Deployment Options
 
-1. **Clone and configure:**
-   ```bash
-   cd codebase-contextifier-9000
-   cp .env.example .env
-   ```
+#### Option A: Centralized Server (Recommended)
 
-2. **Edit `.env` to point to your codebase:**
-   ```bash
-   CODEBASE_PATH=/path/to/your/project
-   EMBEDDING_MODEL=nomic-embed-text
-   ```
+Best for: Indexing from the MCP server, querying across all repositories
 
-3. **Build and start:**
-   ```bash
-   docker-compose up -d
-   ```
+```bash
+# 1. Start the backend
+cd codebase-contextifier-9000
+docker-compose up -d
 
-4. **Configure your MCP client** (see below)
+# 2. Configure Claude Desktop (see below)
+
+# 3. Index any repository
+# In Claude: "Index the repository at /Users/me/projects/my-app"
+```
+
+#### Option B: Per-Project Setup
+
+Best for: Each project manages its own indexing
+
+```bash
+# 1. Start shared backend (once)
+cd codebase-contextifier-9000
+docker-compose up -d
+
+# 2. Copy .mcp.json to each project
+cp .mcp.json.template ~/projects/my-app/.mcp.json
+
+# 3. Open project in Claude Code
+cd ~/projects/my-app
+claude-code .
+```
+
+See [MULTI_PROJECT_SETUP.md](MULTI_PROJECT_SETUP.md) for details.
 
 ### Claude Desktop Configuration
+
+**For Centralized Server (Option A):**
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
@@ -116,67 +151,163 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 }
 ```
 
+**For Per-Project Setup (Option B):**
+
+Just copy `.mcp.json.template` to your project directory - no manual configuration needed!
+
 ### Usage
 
-Once configured, you can use these tools in Claude Desktop:
+Once configured, you can use these tools in Claude Desktop or Claude Code:
 
-**Index your codebase:**
+**Index any repository on your system:**
 ```
-Claude, use the index_repository tool to index the codebase at /workspace
+Claude, index the repository at /Users/me/projects/my-app
 ```
 
-**Search for code:**
+The system spawns a container, indexes the repository in the background, and reports progress.
+
+**Monitor indexing progress:**
+```
+Claude, show me the status of job abc123
+```
+
+**Search for code across all indexed repositories:**
 ```
 Claude, search for "authentication logic" in the codebase
 ```
 
+**Search with filters:**
 ```
-Claude, search for "error handling" filtering by language=python and chunk_type=function
+Claude, search for "error handling" filtering by language=python and repo_name=my-api
 ```
 
-**Extract symbols:**
+**Extract symbols from a file:**
 ```
 Claude, get all functions from /workspace/src/utils.py
 ```
 
-**Check status:**
+**Check system status:**
 ```
-Claude, show me the indexing status
+Claude, show me the indexing status and list all jobs
 ```
 
 ## MCP Tools
 
 ### `index_repository`
 
-Index a code repository with AST-aware chunking.
+Index a repository from any directory on your host machine by spawning a lightweight indexer container.
 
 **Parameters:**
-- `repo_path` (string): Path to repository (default: `/workspace`)
-- `exclude_patterns` (list[string], optional): Glob patterns to exclude
-- `incremental` (bool): Use incremental indexing (default: `true`)
+- `host_path` (string, required): Absolute path on host machine to repository (e.g., `/Users/me/projects/my-app`)
+- `repo_name` (string, optional): Unique identifier for this repository (defaults to directory name)
+- `incremental` (bool): Use incremental indexing to only re-index changed files (default: `true`)
+- `exclude_patterns` (string, optional): Comma-separated glob patterns to exclude (e.g., `"node_modules/*,dist/*"`)
 
 **Returns:**
 ```json
 {
   "success": true,
-  "total_files": 150,
-  "indexed_files": 12,
-  "cached_files": 138,
-  "total_chunks": 450,
-  "cache_hit_rate": "92.00%"
+  "job_id": "abc123def456",
+  "repo_name": "my-app",
+  "status": "queued",
+  "message": "Background indexing started for 'my-app'"
+}
+```
+
+**Example:**
+```python
+# Index a WordPress site, excluding plugins and uploads
+await index_repository(
+    host_path="/Users/me/sites/my-wordpress",
+    repo_name="my-wordpress",
+    exclude_patterns="wp-content/plugins/*,wp-content/uploads/*,wp-includes/*"
+)
+```
+
+### `get_job_status`
+
+Get the status and progress of an indexing job.
+
+**Parameters:**
+- `job_id` (string, required): Job identifier returned from `index_repository`
+
+**Returns:**
+```json
+{
+  "success": true,
+  "job_id": "abc123def456",
+  "repo_name": "my-app",
+  "repo_path": "/Users/me/projects/my-app",
+  "status": "running",
+  "created_at": 1698765432.123,
+  "started_at": 1698765433.456,
+  "elapsed_seconds": 45.2,
+  "progress": {
+    "current_file": 45,
+    "total_files": 100,
+    "progress_pct": 45.0,
+    "current_file_path": "/workspace/src/api/auth.py",
+    "chunks_indexed": 234,
+    "failed_files_count": 2,
+    "cache_hit_rate": "35.50%"
+  }
+}
+```
+
+**Status values:** `"queued"`, `"running"`, `"completed"`, `"failed"`, `"cancelled"`
+
+### `list_indexing_jobs`
+
+List all indexing jobs (past and present).
+
+**Returns:**
+```json
+{
+  "success": true,
+  "total_jobs": 3,
+  "jobs": [
+    {
+      "job_id": "abc123",
+      "repo_name": "my-api",
+      "status": "completed",
+      "progress": { "progress_pct": 100.0, ... }
+    },
+    {
+      "job_id": "def456",
+      "repo_name": "frontend",
+      "status": "running",
+      "progress": { "progress_pct": 67.5, ... }
+    }
+  ]
+}
+```
+
+### `cancel_indexing_job`
+
+Cancel a running indexing job.
+
+**Parameters:**
+- `job_id` (string, required): Job identifier to cancel
+
+**Returns:**
+```json
+{
+  "success": true,
+  "message": "Job abc123 cancelled successfully"
 }
 ```
 
 ### `search_code`
 
-Search code using natural language queries.
+Search code using natural language queries with semantic understanding across all indexed repositories.
 
 **Parameters:**
-- `query` (string): Natural language search query
-- `limit` (int): Max results (default: 10)
-- `language` (string, optional): Filter by language (e.g., `"python"`, `"typescript"`)
-- `file_path_filter` (string, optional): Filter by path pattern
-- `chunk_type` (string, optional): Filter by type (e.g., `"function"`, `"class"`)
+- `query` (string, required): Natural language search query (e.g., "authentication logic", "error handling")
+- `limit` (int): Maximum number of results to return (default: 10)
+- `repo_name` (string, optional): Filter by repository name (searches all repos if not specified)
+- `language` (string, optional): Filter by programming language (e.g., "python", "typescript", "php")
+- `file_path_filter` (string, optional): Filter by file path pattern (e.g., "src/components")
+- `chunk_type` (string, optional): Filter by chunk type (e.g., "function", "class", "method")
 
 **Returns:**
 ```json
@@ -188,6 +319,7 @@ Search code using natural language queries.
     {
       "rank": 1,
       "score": 0.8234,
+      "repo_name": "backend-api",
       "file": "/workspace/src/auth/login.ts",
       "lines": "42-68",
       "language": "typescript",
@@ -435,12 +567,14 @@ This enables:
 ## Roadmap
 
 - [x] Real-time file system watcher for instant updates
-- [ ] Neo4j integration for call graph navigation
-- [ ] Multi-repo search
-- [ ] Reranking with cross-encoders
+- [x] Multi-repo search with shared backend
+- [x] Job-based background indexing with progress tracking
+- [x] On-demand container spawning for flexible repository indexing
+- [ ] **Neo4j integration for relationship tracking** (In Progress) - Track function calls, imports, inheritance
+- [ ] Reranking with cross-encoders for improved accuracy
 - [ ] Fine-tuned embeddings for domain-specific code
 - [ ] HTTP transport for remote MCP servers
-- [ ] Web UI for search
+- [ ] Web UI for search and visualization
 
 ## Research & References
 
